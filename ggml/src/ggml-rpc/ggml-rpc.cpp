@@ -729,6 +729,35 @@ static bool rpc_is_state_name(const char * name) {
     return strncmp(name, "cache_r_l", 9) == 0 || strncmp(name, "cache_s_l", 9) == 0;
 }
 
+// 4-lane, 8-bytes-per-step hash for the state path (fnv_hash is byte-serial, ~25x slower).
+// Both ends use it only for state regions, so the weight/disk cache keeps using fnv_hash.
+static uint64_t rpc_state_hash(const uint8_t * data, size_t len) {
+    const uint64_t P1 = 0x9E3779B185EBCA87ULL;
+    const uint64_t P2 = 0xC2B2AE3D27D4EB4FULL;
+    uint64_t h0 = P1 + P2, h1 = P2, h2 = 0, h3 = 0 - P1;
+    auto mix = [&](uint64_t acc, uint64_t v) {
+        acc += v * P2;
+        acc  = (acc << 31) | (acc >> 33);
+        return acc * P1;
+    };
+    size_t i = 0;
+    for (; i + 32 <= len; i += 32) {
+        uint64_t v0, v1, v2, v3;
+        memcpy(&v0, data + i,      8);
+        memcpy(&v1, data + i + 8,  8);
+        memcpy(&v2, data + i + 16, 8);
+        memcpy(&v3, data + i + 24, 8);
+        h0 = mix(h0, v0); h1 = mix(h1, v1); h2 = mix(h2, v2); h3 = mix(h3, v3);
+    }
+    uint64_t h = ((h0 << 1) | (h0 >> 63)) + ((h1 << 7) | (h1 >> 57)) + ((h2 << 12) | (h2 >> 52)) + ((h3 << 18) | (h3 >> 46));
+    h += (uint64_t) len;
+    for (; i < len; ++i) {
+        h = (h ^ data[i]) * 0x100000001b3ULL;
+    }
+    h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P1; h ^= h >> 32;
+    return h;
+}
+
 static bool rpc_use_state_hash(const ggml_tensor * tensor, size_t size) {
     static const bool enabled = [] {
         const char * e = std::getenv("GGML_RPC_STATE_HASH");
@@ -746,7 +775,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
-        request->hash = fnv_hash((const uint8_t*)data, size);
+        request->hash = state_hash ? rpc_state_hash((const uint8_t*)data, size) : fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
         ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
         if (response.result) {
@@ -980,7 +1009,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
-        request->hash = fnv_hash((const uint8_t*)data, size);
+        request->hash = state_hash ? rpc_state_hash((const uint8_t*)data, size) : fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
         // TODO: make this async
         ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
@@ -1668,7 +1697,7 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     // PATCH(rpc-state-cache)
     if (state_cache_budget > 0 && request.size >= RPC_STATE_MIN_SIZE && rpc_is_state_name(request.tensor.name)) {
-        state_cache_put(fnv_hash(response.data(), response.size()), response);
+        state_cache_put(rpc_state_hash(response.data(), response.size()), response);
     }
     return true;
 }
