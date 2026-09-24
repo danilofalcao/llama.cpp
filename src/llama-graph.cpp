@@ -1092,11 +1092,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    if (inp_attn->self_k_rot) {
+    if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) { // PATCH(attn-rot-persist)
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (inp_attn->self_v_rot && inp_attn->self_v_rot->buffer) { // PATCH(attn-rot-persist)
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
@@ -2863,13 +2863,24 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
-    if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    // PATCH(attn-rot-persist): prefer the rotation matrix resident on this layer's device, so it is not
+    // re-uploaded as a graph input every step (over RPC that is ~272 KB per decode step)
+    ggml_tensor * k_rot = inp->self_k_rot;
+    ggml_tensor * v_rot = inp->self_v_rot;
+    if (k_rot) {
+        if (ggml_tensor * p = inp->mctx->get_k_rot_persist(il)) { k_rot = p; }
+    }
+    if (v_rot) {
+        if (ggml_tensor * p = inp->mctx->get_v_rot_persist(il)) { v_rot = p; }
     }
 
-    if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    if (k_rot) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
+    }
+
+    if (v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -2899,8 +2910,8 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    if (v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
     }
 
     if (wo) {
