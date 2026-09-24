@@ -79,6 +79,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    RPC_CMD_SET_TENSOR_RLE,   // PATCH(rpc-mask-rle)
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -766,9 +767,75 @@ static bool rpc_use_state_hash(const ggml_tensor * tensor, size_t size) {
     return enabled && size >= RPC_STATE_MIN_SIZE && rpc_is_state_name(tensor->name);
 }
 
+// PATCH(rpc-mask-rle): the attention mask (attn_inp_kq_mask, f16) is n_kv x n_tokens and is
+// re-uploaded to every RPC device with attention layers on every ubatch and decode step, so its
+// size grows with the context (512 x 120K x 2 B = 120 MiB per ubatch). Its content is runs of
+// 0 / -inf, so it is sent run-length encoded (lossless) and expanded on the server.
+// Client: GGML_RPC_MASK_RLE=1. Falls back to a plain SET_TENSOR if it does not compress 4x.
+static bool rpc_use_mask_rle(const ggml_tensor * tensor, size_t size) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("GGML_RPC_MASK_RLE");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return enabled && tensor->type == GGML_TYPE_F16 && size >= RPC_STATE_MIN_SIZE && size % 2 == 0 &&
+           strstr(tensor->name, "attn_inp_kq_mask") != nullptr;
+}
+
+// | rpc_tensor | offset (8) | raw_size (8) | runs: { len (u32), value (u16) }* |
+static std::shared_ptr<uint8_t> serialize_set_tensor_rle(const rpc_tensor & rpc_tensor, uint64_t offset, const void * data, size_t size, size_t & input_size) {
+    const uint16_t * v = (const uint16_t *) data;
+    const size_t n = size / 2;
+    const size_t header = sizeof(rpc_tensor) + 2*sizeof(uint64_t);
+    const size_t max_bytes = size / 4;
+    std::vector<uint8_t> runs;
+    runs.reserve(8192);
+    size_t i = 0;
+    while (i < n) {
+        const uint16_t val = v[i];
+        const uint64_t pat = 0x0001000100010001ULL * val;
+        size_t j = i + 1;
+        while (j < n && (j & 3) != 0 && v[j] == val) ++j;
+        if (j < n && v[j] == val) {
+            uint64_t w;
+            while (j + 4 <= n && (memcpy(&w, v + j, 8), w == pat)) j += 4;
+            while (j < n && v[j] == val) ++j;
+        }
+        size_t len = j - i;
+        while (len > 0) {
+            const uint32_t l = (uint32_t) std::min<size_t>(len, 0xFFFFFFFFu);
+            uint8_t rec[6];
+            memcpy(rec, &l, 4);
+            memcpy(rec + 4, &val, 2);
+            runs.insert(runs.end(), rec, rec + 6);
+            len -= l;
+        }
+        if (runs.size() > max_bytes) {
+            return nullptr;
+        }
+        i = j;
+    }
+    input_size = header + runs.size();
+    uint8_t * input = new uint8_t[input_size];
+    uint8_t * p = input;
+    const uint64_t raw_size = size;
+    memcpy(p, &rpc_tensor, sizeof(rpc_tensor)); p += sizeof(rpc_tensor);
+    memcpy(p, &offset,     sizeof(offset));     p += sizeof(offset);
+    memcpy(p, &raw_size,   sizeof(raw_size));   p += sizeof(raw_size);
+    memcpy(p, runs.data(), runs.size());
+    return std::shared_ptr<uint8_t>(input, std::default_delete<uint8_t[]>());
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    if (rpc_use_mask_rle(tensor, size)) { // PATCH(rpc-mask-rle)
+        size_t rle_size;
+        auto rle = serialize_set_tensor_rle(rpc_tensor, offset, data, size, rle_size);
+        if (rle) {
+            ctx->dispatcher->send(RPC_CMD_SET_TENSOR_RLE, rle, rle_size);
+            return;
+        }
+    }
     uint8_t cache_flag = 0;
     const bool state_hash = rpc_use_state_hash(tensor, size); // PATCH(rpc-state-cache)
     if (rpc_use_hash_cache(tensor, size) || state_hash) {
@@ -996,6 +1063,14 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    if (rpc_use_mask_rle(tensor, size)) { // PATCH(rpc-mask-rle)
+        size_t rle_size;
+        auto rle = serialize_set_tensor_rle(rpc_tensor, offset, data, size, rle_size);
+        if (rle) {
+            ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR_RLE, rle, rle_size);
+            return;
+        }
+    }
     uint8_t cache_flag = 0;
     const bool state_hash = rpc_use_state_hash(tensor, size); // PATCH(rpc-state-cache)
     if (rpc_use_hash_cache(tensor, size) || state_hash) {
@@ -1213,6 +1288,7 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor_rle(const std::vector<uint8_t> & input); // PATCH(rpc-mask-rle)
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1480,6 +1556,65 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     return result;
 }
 
+
+// PATCH(rpc-mask-rle): expand a run-length encoded f16 region and upload it
+bool rpc_server::set_tensor_rle(const std::vector<uint8_t> & input) {
+    const size_t header_size = sizeof(rpc_tensor) + 2*sizeof(uint64_t);
+    if (input.size() < header_size || (input.size() - header_size) % 6 != 0) {
+        return false;
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+    uint64_t offset, raw_size;
+    memcpy(&offset,   input.data() + sizeof(rpc_tensor),                    sizeof(offset));
+    memcpy(&raw_size, input.data() + sizeof(rpc_tensor) + sizeof(offset),   sizeof(raw_size));
+    if (raw_size % 2 != 0) {
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || raw_size > (p1 - in_tensor->data - offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region out of buffer bounds\n", __func__);
+            return false;
+        }
+    }
+
+    static thread_local std::vector<uint16_t> buf;
+    const size_t n = raw_size / 2;
+    buf.resize(n);
+    size_t pos = 0;
+    for (const uint8_t * r = input.data() + header_size; r < input.data() + input.size(); r += 6) {
+        uint32_t len;
+        uint16_t val;
+        memcpy(&len, r, 4);
+        memcpy(&val, r + 4, 2);
+        if (len > n - pos) {
+            GGML_LOG_ERROR("[%s] corrupt run-length stream\n", __func__);
+            return false;
+        }
+        std::fill(buf.begin() + pos, buf.begin() + pos + len, val);
+        pos += len;
+    }
+    if (pos != n) {
+        GGML_LOG_ERROR("[%s] run-length stream decodes to %zu of %zu elements\n", __func__, pos, n);
+        return false;
+    }
+    ggml_backend_tensor_set(tensor, buf.data(), offset, raw_size);
+    return true;
+}
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     // serialization format: | rpc_tensor | cache_flag (1 byte) | offset (8 bytes) | data (size bytes) |
@@ -2070,6 +2205,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_RLE: { // PATCH(rpc-mask-rle)
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                if (!server.set_tensor_rle(input)) {
                     return;
                 }
                 break;
