@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
@@ -636,7 +637,26 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    // PATCH(mtp-draft-vocab): the draft only needs plausible candidates (the sampler keeps top-10 and
+    // the target model verifies every token), but projecting onto the full vocabulary costs as much
+    // as a whole layer per drafted token. With LLAMA_MTP_DRAFT_VOCAB=K only the first K rows of the
+    // head are used (a view, no copy; low BPE ids are the most frequent merges). The K logits are
+    // shifted by +C and zero-padded back to n_vocab, so every other token gets ~exp(-C) = 0 and the
+    // softmax among the K candidates is unchanged. Unset/invalid K => upstream path.
+    static const int64_t mtp_draft_vocab = [] {
+        const char * e = std::getenv("LLAMA_MTP_DRAFT_VOCAB");
+        return e ? (int64_t) std::atoll(e) : (int64_t) 0;
+    }();
+    const int64_t n_vocab_head = head_w->ne[1];
+    if (mtp_draft_vocab > 0 && mtp_draft_vocab < n_vocab_head && head_s == nullptr && !ggml_is_transposed(head_w)) {
+        ggml_tensor * head_k = ggml_view_2d(ctx0, head_w, head_w->ne[0], mtp_draft_vocab, head_w->nb[1], 0);
+        cur = ggml_mul_mat(ctx0, head_k, cur);
+        cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
+        cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - mtp_draft_vocab), 0, 0, 0);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
