@@ -232,6 +232,10 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // PATCH(attn-rot-persist): persistent rotation matrix on the device of layer il (nullptr if unavailable)
+    ggml_tensor * get_k_rot_persist(int32_t il) const;
+    ggml_tensor * get_v_rot_persist(int32_t il) const;
+
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
 
@@ -312,6 +316,11 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // PATCH(attn-rot-persist): per-device Hadamard matrices, uploaded once. Kept OUT of ctxs_bufs on purpose:
+    // clear() zeroes every buffer in ctxs_bufs, which would wipe the rotation.
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> rot_ctxs_bufs;
+    std::map<ggml_backend_buffer_type_t, std::pair<ggml_tensor *, ggml_tensor *>> rot_by_buft;
 
     size_t total_size() const;
 
@@ -425,6 +434,10 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // PATCH(attn-rot-persist): persistent rotation matrix on the device of layer il (nullptr if unavailable)
+    ggml_tensor * get_k_rot_persist(int32_t il) const;
+    ggml_tensor * get_v_rot_persist(int32_t il) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;

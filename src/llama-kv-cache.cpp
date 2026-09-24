@@ -362,6 +362,52 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // PATCH(attn-rot-persist): one copy of each rotation matrix per device holding attention layers
+    {
+        const char * e = getenv("LLAMA_ATTN_ROT_PERSIST");
+        const bool rot_persist = e != nullptr && atoi(e) != 0;
+        if (rot_persist && (attn_rot_k || attn_rot_v)) {
+            int64_t nrot_k = 0;
+            if (attn_rot_k) {
+                nrot_k = 64;
+                do { nrot_k *= 2; } while (n_embd_head_k_all % nrot_k == 0);
+                nrot_k /= 2;
+            }
+            const int64_t nrot_v = attn_rot_v ? 64 : 0;
+            const bool have = (!nrot_k || attn_rot_hadamard.count(nrot_k)) && (!nrot_v || attn_rot_hadamard.count(nrot_v));
+            for (const auto & layer : layers) {
+                if (!have || !layer.k || !layer.k->buffer) {
+                    continue;
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
+                if (rot_by_buft.count(buft)) {
+                    continue;
+                }
+                ggml_init_params params = {
+                    /* .mem_size   = */ 2*ggml_tensor_overhead(),
+                    /* .mem_buffer = */ nullptr,
+                    /* .no_alloc   = */ true,
+                };
+                ggml_context_ptr ctx { ggml_init(params) };
+                ggml_tensor * kr = nrot_k ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot_k, nrot_k) : nullptr;
+                ggml_tensor * vr = nrot_v ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, nrot_v, nrot_v) : nullptr;
+                if (kr) { ggml_set_name(kr, "attn_rot_k_persist"); }
+                if (vr) { ggml_set_name(vr, "attn_rot_v_persist"); }
+                ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+                if (!buf) {
+                    LLAMA_LOG_WARN("%s: attn-rot-persist: could not allocate on %s, keeping per-graph input\n", __func__, ggml_backend_buft_name(buft));
+                    continue;
+                }
+                if (kr) { ggml_backend_tensor_set(kr, attn_rot_hadamard.at(nrot_k).data(), 0, ggml_nbytes(kr)); }
+                if (vr) { ggml_backend_tensor_set(vr, attn_rot_hadamard.at(nrot_v).data(), 0, ggml_nbytes(vr)); }
+                rot_by_buft[buft] = { kr, vr };
+                LLAMA_LOG_INFO("%s: attn-rot-persist: rotation matrices resident on %s (k %lld, v %lld)\n", __func__,
+                        ggml_backend_buft_name(buft), (long long) nrot_k, (long long) nrot_v);
+                rot_ctxs_bufs.emplace_back(std::move(ctx), std::move(buf));
+            }
+        }
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
@@ -1821,6 +1867,39 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
+// PATCH(attn-rot-persist)
+ggml_tensor * llama_kv_cache::get_k_rot_persist(int32_t il) const {
+    if (rot_by_buft.empty()) {
+        return nullptr;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    const auto & layer = layers[it->second];
+    if (!layer.k || !layer.k->buffer) {
+        return nullptr;
+    }
+    const auto r = rot_by_buft.find(ggml_backend_buffer_get_type(layer.k->buffer));
+    return r == rot_by_buft.end() ? nullptr : r->second.first;
+}
+
+ggml_tensor * llama_kv_cache::get_v_rot_persist(int32_t il) const {
+    if (rot_by_buft.empty()) {
+        return nullptr;
+    }
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+    const auto & layer = layers[it->second];
+    if (!layer.k || !layer.k->buffer) {
+        return nullptr;
+    }
+    const auto r = rot_by_buft.find(ggml_backend_buffer_get_type(layer.k->buffer));
+    return r == rot_by_buft.end() ? nullptr : r->second.second;
+}
+
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -2810,6 +2889,15 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+// PATCH(attn-rot-persist)
+ggml_tensor * llama_kv_cache_context::get_k_rot_persist(int32_t il) const {
+    return kv->get_k_rot_persist(il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_rot_persist(int32_t il) const {
+    return kv->get_v_rot_persist(il);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
