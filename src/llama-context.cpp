@@ -3205,7 +3205,26 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        // PATCH(rpc-state-ref): a KV region restored by reference may be gone from the RPC server
+        static const auto take_misses = []() -> int (*)(void) {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            return reg ? (int (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_state_ref_take_misses") : nullptr;
+        }();
+        if (take_misses) {
+            take_misses();
+        }
+        const size_t n_read = state_seq_read_data(*io, seq_id, flags);
+        // llama_io_read_host defers the tensor writes to its destructor - flush them now,
+        // otherwise the RPC restores (and their misses) happen after this check
+        io.reset();
+        if (take_misses && take_misses() > 0) {
+            LLAMA_LOG_ERROR("%s: state of seq %d references data the RPC server no longer has - clearing it\n", __func__, seq_id);
+            if (memory) {
+                memory->seq_rm(seq_id, -1, -1);
+            }
+            return 0;
+        }
+        return n_read;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
