@@ -17,6 +17,8 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <list>
+#include <atomic>
 #include <unordered_set>
 #include <cstring>
 #include <fstream>
@@ -80,6 +82,7 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_SET_TENSOR_RLE,   // PATCH(rpc-mask-rle)
+    RPC_CMD_GET_TENSOR_REF,   // PATCH(rpc-state-ref)
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -177,6 +180,12 @@ struct rpc_msg_set_tensor_hash_req {
 
 struct rpc_msg_set_tensor_hash_rsp {
     uint8_t result;
+};
+
+// PATCH(rpc-state-ref)
+struct rpc_msg_get_tensor_ref_rsp {
+    uint64_t hash;
+    uint8_t  result;
 };
 
 struct rpc_msg_get_tensor_req {
@@ -767,6 +776,86 @@ static bool rpc_use_state_hash(const ggml_tensor * tensor, size_t size) {
     return enabled && size >= RPC_STATE_MIN_SIZE && rpc_is_state_name(tensor->name);
 }
 
+// PATCH(rpc-state-ref): saving a sequence state (prompt cache) pulls the KV cache of the layers
+// that live on the RPC server over the network, and restoring it pushes it back. With
+// GGML_RPC_STATE_REF=1 the server keeps the KV region in its own RAM (state cache, keyed by hash)
+// and only a small marker { magic, hash, size } is written into the client-side state blob; a
+// restore sends just the hash. If the server no longer has the region (evicted / restarted) the
+// miss is counted, nothing is written, and llama_state_seq_set_data reports failure so the
+// server falls back to re-processing the prompt. Only cache_k_l* / cache_v_l* take this path:
+// context checkpoints (recurrent state only) always carry real bytes.
+struct rpc_state_ref_marker {
+    char     magic[16];
+    uint64_t hash;
+    uint64_t size;
+};
+static const char RPC_STATE_REF_MAGIC[16] = "GGML-RPC-REF-v1";
+static std::atomic<int> rpc_state_ref_misses{0};
+
+static bool rpc_use_state_ref(const ggml_tensor * tensor, size_t size) {
+    static const bool enabled = [] {
+        const char * e = std::getenv("GGML_RPC_STATE_REF");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return enabled && size >= RPC_STATE_MIN_SIZE &&
+           (strncmp(tensor->name, "cache_k_l", 9) == 0 || strncmp(tensor->name, "cache_v_l", 9) == 0);
+}
+
+static bool rpc_state_ref_parse(const void * data, size_t size, rpc_state_ref_marker & m) {
+    if (size < sizeof(m)) {
+        return false;
+    }
+    memcpy(&m, data, sizeof(m));
+    return memcmp(m.magic, RPC_STATE_REF_MAGIC, sizeof(m.magic)) == 0 && m.size == size;
+}
+
+// returns true if the request was fully handled (marker restored, or a miss was recorded)
+template <typename D>
+static bool rpc_state_ref_restore(D * dispatcher, const rpc_tensor & rpc_tensor, const ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    rpc_state_ref_marker m;
+    if (!rpc_use_state_ref(tensor, size) || !rpc_state_ref_parse(data, size, m)) {
+        return false;
+    }
+    auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
+    request->tensor = rpc_tensor;
+    request->offset = offset;
+    request->hash   = m.hash;
+    rpc_msg_set_tensor_hash_rsp response;
+    dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
+    if (!response.result) {
+        rpc_state_ref_misses++;
+        GGML_LOG_ERROR("%s: state region %s (+%zu, %zu bytes, hash %016" PRIx64 ") is no longer on the server\n",
+                       __func__, tensor->name, offset, size, m.hash);
+    }
+    return true;
+}
+
+template <typename D>
+static bool rpc_state_ref_save(D * dispatcher, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (!rpc_use_state_ref(tensor, size)) {
+        return false;
+    }
+    auto request = std::make_shared<rpc_msg_get_tensor_req>();
+    request->tensor = serialize_tensor(tensor);
+    request->offset = offset;
+    request->size   = size;
+    rpc_msg_get_tensor_ref_rsp response;
+    dispatcher->send(RPC_CMD_GET_TENSOR_REF, request, sizeof(*request), &response, sizeof(response));
+    if (!response.result) {
+        return false; // server has no room: fall back to a real GET_TENSOR
+    }
+    rpc_state_ref_marker m;
+    memcpy(m.magic, RPC_STATE_REF_MAGIC, sizeof(m.magic));
+    m.hash = response.hash;
+    m.size = size;
+    memcpy(data, &m, sizeof(m));
+    return true;
+}
+
+static int ggml_backend_rpc_state_ref_take_misses(void) {
+    return rpc_state_ref_misses.exchange(0);
+}
+
 // PATCH(rpc-mask-rle): the attention mask (attn_inp_kq_mask, f16) is n_kv x n_tokens and is
 // re-uploaded to every RPC device with attention layers on every ubatch and decode step, so its
 // size grows with the context (512 x 120K x 2 B = 120 MiB per ubatch). Its content is runs of
@@ -828,6 +917,9 @@ static std::shared_ptr<uint8_t> serialize_set_tensor_rle(const rpc_tensor & rpc_
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    if (rpc_state_ref_restore(ctx->dispatcher.get(), rpc_tensor, tensor, data, offset, size)) { // PATCH(rpc-state-ref)
+        return;
+    }
     if (rpc_use_mask_rle(tensor, size)) { // PATCH(rpc-mask-rle)
         size_t rle_size;
         auto rle = serialize_set_tensor_rle(rpc_tensor, offset, data, size, rle_size);
@@ -860,6 +952,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (rpc_state_ref_save(ctx->dispatcher.get(), tensor, data, offset, size)) { // PATCH(rpc-state-ref)
+        return;
+    }
     auto request = std::make_shared<rpc_msg_get_tensor_req>();
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
@@ -1070,6 +1165,9 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    if (rpc_state_ref_restore(ctx->dispatcher.get(), rpc_tensor, tensor, data, offset, size)) { // PATCH(rpc-state-ref)
+        return;
+    }
     if (rpc_use_mask_rle(tensor, size)) { // PATCH(rpc-mask-rle)
         size_t rle_size;
         auto rle = serialize_set_tensor_rle(rpc_tensor, offset, data, size, rle_size);
@@ -1103,6 +1201,9 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
 
 static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
+    if (rpc_state_ref_save(ctx->dispatcher.get(), tensor, data, offset, size)) { // PATCH(rpc-state-ref)
+        return;
+    }
     auto request = std::make_shared<rpc_msg_get_tensor_req>();
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
@@ -1298,6 +1399,7 @@ public:
     bool set_tensor_rle(const std::vector<uint8_t> & input); // PATCH(rpc-mask-rle)
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+    bool get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response); // PATCH(rpc-state-ref)
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
@@ -1320,9 +1422,14 @@ private:
 
 
     // PATCH(rpc-state-cache): RAM cache of recurrent-state regions sent by get_tensor
-    void state_cache_put(uint64_t hash, const std::vector<uint8_t> & data);
-    std::unordered_map<uint64_t, std::vector<uint8_t>> state_cache;
-    std::deque<uint64_t> state_cache_order;
+    // PATCH(rpc-state-ref): LRU (touched on every hit) instead of FIFO, and no copy on restore
+    struct state_entry {
+        std::vector<uint8_t>          data;
+        std::list<uint64_t>::iterator lru;
+    };
+    bool state_cache_put(uint64_t hash, std::vector<uint8_t> data);
+    std::unordered_map<uint64_t, state_entry> state_cache;
+    std::list<uint64_t> state_cache_order;
     size_t state_cache_bytes  = 0;
     size_t state_cache_budget = [] {
         const char * e = std::getenv("GGML_RPC_STATE_CACHE_MB");
@@ -1679,21 +1786,27 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
 }
 
 // PATCH(rpc-state-cache): FIFO-bounded RAM cache
-void rpc_server::state_cache_put(uint64_t hash, const std::vector<uint8_t> & data) {
-    if (data.size() > state_cache_budget || state_cache.count(hash) != 0) {
-        return;
+bool rpc_server::state_cache_put(uint64_t hash, std::vector<uint8_t> data) {
+    auto hit = state_cache.find(hash);
+    if (hit != state_cache.end()) {
+        state_cache_order.splice(state_cache_order.end(), state_cache_order, hit->second.lru);
+        return hit->second.data.size() == data.size();
+    }
+    if (data.size() > state_cache_budget) {
+        return false;
     }
     while (state_cache_bytes + data.size() > state_cache_budget && !state_cache_order.empty()) {
         auto it = state_cache.find(state_cache_order.front());
         state_cache_order.pop_front();
         if (it != state_cache.end()) {
-            state_cache_bytes -= it->second.size();
+            state_cache_bytes -= it->second.data.size();
             state_cache.erase(it);
         }
     }
-    state_cache.emplace(hash, data);
-    state_cache_order.push_back(hash);
     state_cache_bytes += data.size();
+    state_cache_order.push_back(hash);
+    state_cache.emplace(hash, state_entry{ std::move(data), std::prev(state_cache_order.end()) });
+    return true;
 }
 
 bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
@@ -1719,15 +1832,19 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     std::vector<uint8_t> cached_file;
+    const uint8_t * src_data = nullptr;
     // PATCH(rpc-state-cache): recently read recurrent-state regions first
     auto sc = state_cache.find(request.hash);
     if (sc != state_cache.end()) {
-        cached_file = sc->second;
-    } else if (!get_cached_file(request.hash, cached_file)) {
+        state_cache_order.splice(state_cache_order.end(), state_cache_order, sc->second.lru); // PATCH(rpc-state-ref)
+        src_data = sc->second.data.data();
+    } else if (get_cached_file(request.hash, cached_file)) {
+        src_data = cached_file.data();
+    } else {
         response.result = 0;
         return true;
     }
-    size_t size = cached_file.size();
+    size_t size = sc != state_cache.end() ? sc->second.data.size() : cached_file.size();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1757,7 +1874,7 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    ggml_backend_tensor_set(tensor, src_data, request.offset, size);
     response.result = 1;
     return true;
 }
@@ -1833,6 +1950,44 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     // PATCH(rpc-state-cache)
     if (state_cache_budget > 0 && request.size >= RPC_STATE_MIN_SIZE && rpc_is_state_name(request.tensor.name)) {
         state_cache_put(rpc_state_hash(response.data(), response.size()), response);
+    }
+    return true;
+}
+
+// PATCH(rpc-state-ref): read a KV region into the state cache and return only its hash
+bool rpc_server::get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response) {
+    response.hash   = 0;
+    response.result = 0;
+    if (state_cache_budget == 0 || request.size < RPC_STATE_MIN_SIZE || request.size > state_cache_budget) {
+        return true;
+    }
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (request.tensor.data + request.offset < p0 || request.tensor.data + request.offset >= p1 ||
+            request.size > (p1 - request.tensor.data - request.offset)) {
+            GGML_LOG_ERROR("[%s] requested tensor region out of buffer bounds\n", __func__);
+            return false;
+        }
+    }
+    std::vector<uint8_t> data(request.size);
+    ggml_backend_tensor_get(tensor, data.data(), request.offset, request.size);
+    const uint64_t hash = rpc_state_hash(data.data(), data.size());
+    if (state_cache_put(hash, std::move(data))) {
+        response.hash   = hash;
+        response.result = 1;
     }
     return true;
 }
@@ -2216,6 +2371,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_GET_TENSOR_REF: { // PATCH(rpc-state-ref)
+                rpc_msg_get_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_get_tensor_ref_rsp response;
+                if (!server.get_tensor_ref(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_SET_TENSOR_RLE: { // PATCH(rpc-mask-rle)
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -2533,6 +2702,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_state_ref_take_misses") == 0) { // PATCH(rpc-state-ref)
+        return (void *)ggml_backend_rpc_state_ref_take_misses;
     }
     return NULL;
 
