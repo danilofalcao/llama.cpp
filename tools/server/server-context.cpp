@@ -321,6 +321,10 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
+        if (spec) { // PATCH(mtp-state)
+            common_speculative_get_state(spec, id, cur->data.spec);
+        }
+
         return true;
     }
 
@@ -328,6 +332,10 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        }
+
+        if (res && spec && !prompt_cache.loaded_spec.empty()) { // PATCH(mtp-state)
+            common_speculative_set_state(spec, id, prompt_cache.loaded_spec);
         }
 
         return res;
@@ -3144,8 +3152,22 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
+            // PATCH(decode-priority): a prompt chunk and the decode tokens of the other slots run in
+            // one non-preemptible step, so a long prefill freezes every generating slot for
+            // ceil(prompt / n_batch) steps (ggml-org/llama.cpp#29175, discussion #26022). With
+            // LLAMA_SERVER_DECODE_PRIORITY=N, while any slot is generating (its tokens are already in
+            // the batch) at most N prompt tokens are admitted per step; with nobody generating the
+            // prompt still uses the full n_batch.
+            static const int32_t decode_priority = [] {
+                const char * e = std::getenv("LLAMA_SERVER_DECODE_PRIORITY");
+                return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+            }();
+            const int32_t n_batch_prompt = (decode_priority > 0 && batch.size() > 0)
+                ? std::min<int32_t>(n_batch, (int32_t) batch.size() + decode_priority)
+                : n_batch;
+
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3554,7 +3576,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

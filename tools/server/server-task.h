@@ -588,6 +588,7 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec; // PATCH(mtp-state): speculative-decoding state of the sequence
 
     size_t size() const {
         return main.size() + drft.size();
@@ -628,6 +629,8 @@ struct server_prompt_cache {
     size_t n_tokens() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    std::vector<uint8_t> loaded_spec; // PATCH(mtp-state): spec state of the entry restored by the last load()
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

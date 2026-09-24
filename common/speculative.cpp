@@ -1463,6 +1463,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
+    // PATCH(mtp-state): the last target hidden state of each sequence (pending_h) feeds the first
+    // MTP step after the next batch. Checkpoint restores and the server prompt cache restore the
+    // KV of the target and draft contexts but not this row, so the first MTP step after a restore
+    // used the hidden state of whatever the slot processed before (another conversation).
+    static bool mtp_state_enabled() {
+        static const bool on = [] { const char * e = std::getenv("LLAMA_MTP_STATE"); return e != nullptr && std::atoi(e) != 0; }();
+        return on;
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (!mtp_state_enabled() || seq_id < 0 || seq_id >= (llama_seq_id) pending_h.size()) {
+            return false;
+        }
+        const size_t nb = pending_h[seq_id].size() * sizeof(float);
+        data.resize(nb);
+        std::memcpy(data.data(), pending_h[seq_id].data(), nb);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!mtp_state_enabled() || seq_id < 0 || seq_id >= (llama_seq_id) pending_h.size() || data.size() != pending_h[seq_id].size() * sizeof(float)) {
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data(), data.size());
+    }
+
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
