@@ -1671,8 +1671,35 @@ private:
             }
         }
 
+        // PATCH(xslot-prefix): pick the idle slot that keeps the most and throws away the least cached work.
+        // Plain LCP similarity lets a new session (sharing only the agent's system prompt) take a slot holding
+        // a long conversation and wipe it; the shared prefix can be copied from any slot anyway (xslot).
+        bool selected_by_cost = false;
+        if (ret == nullptr && task.id_slot == -1 && xslot_prefix_min() > 0) {
+            int64_t best = INT64_MIN;
+            int64_t best_lcp = 0;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
+                const int64_t n_cached = (int64_t) slot.prompt.tokens.size();
+                const int64_t lcp      = n_cached > 0 ? (int64_t) slot.prompt.tokens.get_common_prefix(task.tokens) : 0;
+                const int64_t score    = lcp - (n_cached - lcp);
+                if (score > best || (score == best && ret != nullptr && slot.t_last_used < ret->t_last_used)) {
+                    best     = score;
+                    best_lcp = lcp;
+                    ret      = &slot;
+                }
+            }
+            if (ret != nullptr) {
+                selected_by_cost = true;
+                SLT_INF(*ret, "selected slot by cache cost: reuse %" PRId64 " of %zu cached tokens (discard %" PRId64 ")\n",
+                        best_lcp, ret->prompt.tokens.size(), (int64_t) ret->prompt.tokens.size() - best_lcp);
+            }
+        }
+
         // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
+        if (!selected_by_cost && slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
             for (server_slot & slot : slots) {
@@ -2723,7 +2750,9 @@ private:
                         f.write((const char *) &n_ck, sizeof(n_ck));
                         size_t i = 0;
                         for (const auto & c : cks) {
-                            if (i++ < cks.size() - n_keep) {
+                            const size_t idx = i++;
+                            // keep the first checkpoint (shared system prompt, used by xslot) and the last n_keep-1
+                            if (n_keep > 0 && idx != 0 && idx < cks.size() - (n_keep - 1)) {
                                 continue;
                             }
                             f.write((const char *) &c.n_tokens, sizeof(c.n_tokens));
