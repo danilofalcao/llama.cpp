@@ -903,6 +903,44 @@ static void ckpt_rpc_ref(bool on) {
     }
 }
 
+// PATCH(prompt-srpt): LLAMA_PROMPT_SRPT=1 -> when several slots have prompt tokens pending, fill the
+// batch with the one that has the fewest tokens left first, so a long history does not hold short
+// turns of other sessions behind it (and short ones finish and start generating sooner).
+static bool prompt_srpt() {
+    static const bool v = [] {
+        const char * e = std::getenv("LLAMA_PROMPT_SRPT");
+        const bool on = e != nullptr && std::atoi(e) != 0;
+        fprintf(stderr, "prompt-srpt: %s\n", on ? "on" : "off");
+        return on;
+    }();
+    return v;
+}
+
+// PATCH(slot-persist): LLAMA_SLOT_PERSIST=N (N>0) -> /slots save/restore also keep, in "<file>.extra",
+// the draft (MTP) context state, the speculative state and the last N context checkpoints of the slot.
+// Without them a hybrid model cannot reuse a restored conversation (the next turn diverges before
+// the end of the saved state and needs a checkpoint).
+static int slot_persist_ckpts() {
+    static const int v = [] {
+        const char * e = std::getenv("LLAMA_SLOT_PERSIST");
+        return e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    return v;
+}
+
+static void sp_put_blob(std::ofstream & f, const std::vector<uint8_t> & v) {
+    const uint64_t n = v.size();
+    f.write((const char *) &n, sizeof(n));
+    if (n) f.write((const char *) v.data(), n);
+}
+
+static bool sp_get_blob(std::ifstream & f, std::vector<uint8_t> & v) {
+    uint64_t n = 0;
+    if (!f.read((char *) &n, sizeof(n)) || n > (uint64_t) 16 << 30) return false;
+    v.resize(n);
+    return n == 0 || (bool) f.read((char *) v.data(), n);
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -2664,6 +2702,46 @@ private:
                         break;
                     }
 
+                    if (slot_persist_ckpts() > 0) { // PATCH(slot-persist)
+                        std::ofstream f(filepath + ".extra", std::ios::binary | std::ios::trunc);
+                        const char magic[4] = {'Q', 'X', 'S', '1'};
+                        f.write(magic, 4);
+                        std::vector<uint8_t> dft;
+                        if (ctx_dft) {
+                            dft.resize(llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE));
+                            dft.resize(llama_state_seq_get_data_ext(ctx_dft, dft.data(), dft.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE));
+                        }
+                        sp_put_blob(f, dft);
+                        std::vector<uint8_t> sst;
+                        if (spec) {
+                            common_speculative_get_state(spec.get(), slot->id, sst);
+                        }
+                        sp_put_blob(f, sst);
+                        const auto & cks = slot->prompt.checkpoints;
+                        const size_t n_keep = std::min(cks.size(), (size_t) slot_persist_ckpts());
+                        const uint32_t n_ck = (uint32_t) n_keep;
+                        f.write((const char *) &n_ck, sizeof(n_ck));
+                        size_t i = 0;
+                        for (const auto & c : cks) {
+                            if (i++ < cks.size() - n_keep) {
+                                continue;
+                            }
+                            f.write((const char *) &c.n_tokens, sizeof(c.n_tokens));
+                            f.write((const char *) &c.id_task,  sizeof(c.id_task));
+                            f.write((const char *) &c.pos_min,  sizeof(c.pos_min));
+                            f.write((const char *) &c.pos_max,  sizeof(c.pos_max));
+                            sp_put_blob(f, c.data_tgt);
+                            sp_put_blob(f, c.data_dft);
+                            sp_put_blob(f, c.data_spec);
+                        }
+                        if (!f.good()) {
+                            std::filesystem::remove(filepath + ".extra");
+                            send_error(task, "Unable to save slot extra state", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        SLT_INF(*slot, "slot-persist: saved %zu tokens, %u checkpoints\n", slot->prompt.tokens.size(), n_ck);
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2723,6 +2801,39 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        if (slot_persist_ckpts() > 0) { // PATCH(slot-persist)
+                            std::ifstream f(filepath + ".extra", std::ios::binary);
+                            char magic[4] = {0, 0, 0, 0};
+                            if (!f.read(magic, 4) || memcmp(magic, "QXS1", 4) != 0) {
+                                throw std::runtime_error("missing or invalid .extra file (draft/checkpoint state)");
+                            }
+                            std::vector<uint8_t> dft, sst;
+                            if (!sp_get_blob(f, dft) || !sp_get_blob(f, sst)) {
+                                throw std::runtime_error("truncated .extra file");
+                            }
+                            if (ctx_dft && !dft.empty() &&
+                                    llama_state_seq_set_data_ext(ctx_dft, dft.data(), dft.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) != dft.size()) {
+                                throw std::runtime_error("failed to restore draft context state");
+                            }
+                            if (spec) {
+                                common_speculative_set_state(spec.get(), slot->id, sst);
+                            }
+                            uint32_t n_ck = 0;
+                            if (!f.read((char *) &n_ck, sizeof(n_ck))) {
+                                throw std::runtime_error("truncated .extra file");
+                            }
+                            for (uint32_t i = 0; i < n_ck; ++i) {
+                                common_prompt_checkpoint c;
+                                if (!f.read((char *) &c.n_tokens, sizeof(c.n_tokens)) || !f.read((char *) &c.id_task, sizeof(c.id_task)) ||
+                                    !f.read((char *) &c.pos_min, sizeof(c.pos_min))   || !f.read((char *) &c.pos_max, sizeof(c.pos_max)) ||
+                                    !sp_get_blob(f, c.data_tgt) || !sp_get_blob(f, c.data_dft) || !sp_get_blob(f, c.data_spec)) {
+                                    throw std::runtime_error("truncated checkpoint in .extra file");
+                                }
+                                slot->prompt.checkpoints.push_back(std::move(c));
+                            }
+                            SLT_INF(*slot, "slot-persist: restored %zu tokens, %u checkpoints\n", slot->prompt.tokens.size(), n_ck);
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3210,7 +3321,25 @@ private:
                 ? std::min<int32_t>(n_batch, (int32_t) batch.size() + decode_priority)
                 : n_batch;
 
-            iterate(slots, [&](server_slot & slot) {
+            std::vector<server_slot *> prompt_order;
+            for (auto & s : slots) {
+                prompt_order.push_back(&s);
+            }
+            if (prompt_srpt()) {
+                std::vector<int64_t> rem(slots.size(), -1);
+                for (auto * sp : prompt_order) {
+                    if ((sp->state == SLOT_STATE_PROCESSING_PROMPT || sp->state == SLOT_STATE_STARTED) && sp->task) {
+                        const int64_t done = sp->state == SLOT_STATE_STARTED
+                            ? (int64_t) sp->prompt.tokens.get_common_prefix(sp->task->tokens)
+                            : (int64_t) sp->prompt.n_tokens();
+                        rem[sp->id] = std::max<int64_t>(0, (int64_t) sp->task->n_tokens() - done);
+                    }
+                }
+                std::stable_sort(prompt_order.begin(), prompt_order.end(),
+                        [&](const server_slot * a, const server_slot * b) { return rem[a->id] < rem[b->id]; });
+            }
+
+            iterate(prompt_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
