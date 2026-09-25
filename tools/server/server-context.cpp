@@ -3325,8 +3325,9 @@ private:
             for (auto & s : slots) {
                 prompt_order.push_back(&s);
             }
+            std::vector<int64_t> rem(slots.size(), -1);
+            bool srpt_exclusive = false;
             if (prompt_srpt()) {
-                std::vector<int64_t> rem(slots.size(), -1);
                 for (auto * sp : prompt_order) {
                     if ((sp->state == SLOT_STATE_PROCESSING_PROMPT || sp->state == SLOT_STATE_STARTED) && sp->task) {
                         const int64_t done = sp->state == SLOT_STATE_STARTED
@@ -3342,6 +3343,9 @@ private:
             iterate(prompt_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
+                }
+                if (srpt_exclusive) {
+                    return; // PATCH(prompt-srpt): a short prompt is being processed alone this step
                 }
 
                 if (!slot.is_processing()) {
@@ -3391,8 +3395,19 @@ private:
                                 }
                             }
                             if (!has_ckpt) {
-                                wait = true;
-                                break;
+                                // it will only help if it is still going to checkpoint at a user-message start
+                                // that lies inside the shared prefix (otherwise waiting is pure loss)
+                                for (const auto & sp : other.task->params.message_spans.spans) {
+                                    const int64_t p = (int64_t) sp.pos;
+                                    if (sp.role == COMMON_CHAT_ROLE_USER && p >= own + xslot_prefix_min() && p <= lcp &&
+                                            p >= (int64_t) other.prompt.n_tokens() && p < (int64_t) input_tokens.size()) {
+                                        wait = true;
+                                        break;
+                                    }
+                                }
+                                if (wait) {
+                                    break;
+                                }
                             }
                         }
                         if (wait) {
@@ -3403,6 +3418,11 @@ private:
                             return;
                         }
                         slot.xslot_waiting = false;
+                    }
+
+                    // PATCH(prompt-srpt): short prompts (a new turn) do not share the step with a long prefill
+                    if (prompt_srpt() && rem[slot.id] >= 0 && rem[slot.id] <= n_ubatch) {
+                        srpt_exclusive = true;
                     }
 
                     if (slot.state == SLOT_STATE_STARTED) {
