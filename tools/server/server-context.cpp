@@ -868,6 +868,20 @@ static const ckpt_net_cfg & ckpt_net_get() {
     return cfg;
 }
 
+// PATCH(xslot-prefix): LLAMA_XSLOT_PREFIX=N (N>0) lets a slot that starts a new prompt take the
+// longest prefix another slot already holds (e.g. an agent's shared system prompt) instead of
+// re-processing it: the attention KV is shared with seq_cp and the recurrent state comes from the
+// other slot's context checkpoint. Only used when it saves at least N tokens. 0 / unset = off.
+static int xslot_prefix_min() {
+    static const int v = [] {
+        const char * e = std::getenv("LLAMA_XSLOT_PREFIX");
+        const int n = e ? std::max(0, std::atoi(e)) : 0;
+        fprintf(stderr, "xslot-prefix: min_gain=%d (%s)\n", n, n > 0 ? "on" : "off");
+        return n;
+    }();
+    return v;
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -2371,12 +2385,17 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // PATCH(xslot-prefix): keep the oldest checkpoint (end of the shared system prompt), drop the next one
+            auto victim = slot.prompt.checkpoints.begin();
+            if (xslot_prefix_min() > 0 && slot.prompt.checkpoints.size() > 1) {
+                ++victim;
+            }
+            const auto & cur = *victim;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -3272,6 +3291,42 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // PATCH(xslot-prefix): take a longer prefix from another slot, if one has it
+                                if (xslot_prefix_min() > 0 && !slot.prompt.tokens.has_mtmd && !input_tokens.has_mtmd && slot.alora_invocation_start <= 0) {
+                                    const server_slot              * src = nullptr;
+                                    const common_prompt_checkpoint * ck  = nullptr;
+                                    for (const auto & other : slots) {
+                                        if (other.id == slot.id || other.prompt.tokens.has_mtmd || other.prompt.checkpoints.empty()) {
+                                            continue;
+                                        }
+                                        const int64_t lcp = other.prompt.tokens.get_common_prefix(input_tokens);
+                                        for (const auto & c : other.prompt.checkpoints) {
+                                            if (c.n_tokens <= 0 || c.n_tokens > lcp || c.n_tokens >= (int64_t) input_tokens.size() ||
+                                                c.pos_max + 1 != c.n_tokens || c.n_tokens < (int64_t) n_past + xslot_prefix_min()) {
+                                                continue;
+                                            }
+                                            if (ck == nullptr || c.n_tokens > ck->n_tokens) {
+                                                ck  = &c;
+                                                src = &other;
+                                            }
+                                        }
+                                    }
+                                    if (ck != nullptr) {
+                                        const int64_t n_copy = ck->n_tokens;
+                                        slot.mem.seq_rm(slot.id, -1, -1);
+                                        slot.mem.seq_cp(src->id, slot.id, 0, (llama_pos) n_copy);
+                                        ck->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        ck->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        common_speculative_set_state(spec.get(), slot.id, ck->data_spec);
+                                        slot.prompt.tokens = src->prompt.tokens.clone();
+                                        slot.prompt.tokens.keep_first(n_copy);
+                                        slot.prompt.checkpoints.clear();
+                                        slot.prompt.checkpoints.push_back(*ck);
+                                        SLT_INF(slot, "xslot-prefix: took %" PRId64 " prompt tokens from slot %d (own reuse was %d)\n", n_copy, src->id, n_past);
+                                        n_past = (int) n_copy;
+                                    }
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
