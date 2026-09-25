@@ -884,6 +884,25 @@ static int xslot_prefix_min() {
     return v;
 }
 
+// PATCH(ckpt-rpc-ref): LLAMA_CKPT_RPC_REF=1 -> context checkpoints keep the recurrent state of RPC
+// layers on the RPC server (by reference) instead of pulling it over the network on every turn.
+static void ckpt_rpc_ref(bool on) {
+    static void (*fn)(int) = [] {
+        const char * e = std::getenv("LLAMA_CKPT_RPC_REF");
+        const bool enabled = e != nullptr && std::atoi(e) != 0;
+        void (*f)(int) = nullptr;
+        if (enabled) {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            f = reg ? (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_state_ref_recurrent") : nullptr;
+        }
+        fprintf(stderr, "ckpt-rpc-ref: %s\n", f ? "on" : "off");
+        return f;
+    }();
+    if (fn) {
+        fn(on ? 1 : 0);
+    }
+}
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -2422,8 +2441,12 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_ckpt0 = ggml_time_us();
+        ckpt_rpc_ref(true);
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        ckpt_rpc_ref(false);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        SLT_INF(slot, "checkpoint saved at n_tokens = %" PRId64 " in %.0f ms\n", cur.n_tokens, (ggml_time_us() - t_ckpt0) / 1000.0);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -3356,7 +3379,12 @@ private:
                                         const int64_t n_copy = ck->n_tokens;
                                         slot.mem.seq_rm(slot.id, -1, -1);
                                         slot.mem.seq_cp(src->id, slot.id, 0, (llama_pos) n_copy);
-                                        ck->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (!ck->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                            SLT_WRN(slot, "xslot-prefix: checkpoint of slot %d is no longer available, re-processing the prompt\n", src->id);
+                                            slot.mem.seq_rm(slot.id, -1, -1);
+                                            slot.prompt.clear();
+                                            n_past = 0;
+                                        } else {
                                         ck->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         common_speculative_set_state(spec.get(), slot.id, ck->data_spec);
                                         slot.prompt.tokens = src->prompt.tokens.clone();
@@ -3365,6 +3393,7 @@ private:
                                         slot.prompt.checkpoints.push_back(*ck);
                                         SLT_INF(slot, "xslot-prefix: took %" PRId64 " prompt tokens from slot %d (own reuse was %d)\n", n_copy, src->id, n_past);
                                         n_past = (int) n_copy;
+                                        }
                                     }
                                 }
 
@@ -3514,9 +3543,14 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
-                                    if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    const int64_t t_rest0 = ggml_time_us();
+                                    if (!do_reset && !it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                        // PATCH(ckpt-rpc-ref): referenced state gone from the RPC server -> the sequence was cleared
+                                        SLT_WRN(slot, "%s", "context checkpoint no longer available on the RPC server, re-processing the prompt\n");
+                                        do_reset = true;
+                                    } else if (!do_reset) {
+                                        // restore the context checkpoint (target state loaded above)
+                                        SLT_INF(slot, "checkpoint restored at n_tokens = %" PRId64 " in %.0f ms\n", it->n_tokens, (ggml_time_us() - t_rest0) / 1000.0);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
@@ -4118,7 +4152,9 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (!ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                            GGML_ABORT("failed to restore speculative checkpoint");
+                        }
 
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
