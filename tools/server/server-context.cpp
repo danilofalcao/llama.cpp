@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <random>
 #include <utility>
+#include <map>
 #include <fstream>
 
 // fix problem with std::min and std::max
@@ -1798,6 +1799,46 @@ private:
         }
 
         return ret;
+    }
+
+    // PATCH(spec-kv-retry): per-slot cell usage of target and draft memory, for diagnosing draft KV exhaustion
+    void spec_log_kv_usage(const char * what) const {
+        if (!ctx_dft) {
+            return;
+        }
+        auto * mem_tgt = llama_get_memory(ctx_tgt);
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        for (const auto & slot : slots) {
+            SRV_WRN("%s: slot %d processing=%d n_tokens=%d tgt=[%d,%d] dft=[%d,%d]\n", what, slot.id,
+                    (int) slot.is_processing(), (int) slot.prompt.n_tokens(),
+                    (int) llama_memory_seq_pos_min(mem_tgt, slot.id), (int) llama_memory_seq_pos_max(mem_tgt, slot.id),
+                    (int) llama_memory_seq_pos_min(mem_dft, slot.id), (int) llama_memory_seq_pos_max(mem_dft, slot.id));
+        }
+    }
+
+    // PATCH(spec-kv-retry): remove the draft cells at/after the first position of every sequence in the batch
+    bool spec_rollback_batch(const llama_batch & b) {
+        if (!ctx_dft || llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt)) {
+            return true;
+        }
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        std::map<llama_seq_id, llama_pos> pos_beg;
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            for (int32_t j = 0; j < b.n_seq_id[i]; ++j) {
+                const llama_seq_id s = b.seq_id[i][j];
+                auto it = pos_beg.find(s);
+                if (it == pos_beg.end() || b.pos[i] < it->second) {
+                    pos_beg[s] = b.pos[i];
+                }
+            }
+        }
+        for (const auto & [s, p] : pos_beg) {
+            if (!llama_memory_seq_rm(mem_dft, s, p, -1)) {
+                SRV_WRN("spec rollback: cannot remove draft cells of seq %d from pos %d\n", (int) s, (int) p);
+                return false;
+            }
+        }
+        return true;
     }
 
     // return true if at least one slot has been cleared
@@ -4131,14 +4172,46 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
-            });
+            for (;;) {
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch_view);
+                });
+
+                if (ok) {
+                    break;
+                }
+
+                // PATCH(spec-kv-retry): the draft context has its own KV pool of the same size as the target, but it
+                // holds extra cells (drafted positions, different fragmentation), so it can run out of space even
+                // when the target decode of this batch fit. Do what the target path does: purge an idle slot
+                // (target + draft memory) and retry the draft pass only - the target batch is already committed.
+                spec_log_kv_usage("draft pass failed");
+
+                if (!try_clear_idle_slots()) {
+                    break;
+                }
+
+                // drop any draft cells a partially committed draft pass left for the positions of this batch
+                if (!spec_rollback_batch(batch_view)) {
+                    break;
+                }
+
+                SRV_WRN("%s", "draft context out of KV space, purged an idle slot, retrying the speculative batch\n");
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
 
-                // TODO: handle error
+                // the target has this batch but the draft does not -> the slots are out of sync and every
+                // follow-up request would fail the same way. Clear them, like the target context-exceeded path.
+                for (auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        send_error(slot, "Context size has been exceeded (speculative draft context is full).");
+                        slot.release();
+                        slot.prompt_clear();
+                    }
+                }
+
                 throw std::runtime_error("failed to process speculative batch");
             }
         }
