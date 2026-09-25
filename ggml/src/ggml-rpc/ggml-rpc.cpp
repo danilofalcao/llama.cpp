@@ -792,13 +792,27 @@ struct rpc_state_ref_marker {
 static const char RPC_STATE_REF_MAGIC[16] = "GGML-RPC-REF-v1";
 static std::atomic<int> rpc_state_ref_misses{0};
 
-static bool rpc_use_state_ref(const ggml_tensor * tensor, size_t size) {
+// PATCH(ckpt-rpc-ref): while the client has this set (context-checkpoint creation only), recurrent
+// state regions (cache_r_l*/cache_s_l*) are saved by reference too, so a checkpoint no longer pulls
+// the remote layers' recurrent state over the network. Markers are recognised on restore regardless.
+static std::atomic<bool> rpc_state_ref_recurrent{false};
+
+static void ggml_backend_rpc_state_ref_recurrent(int on) {
+    rpc_state_ref_recurrent.store(on != 0);
+}
+
+static bool rpc_use_state_ref(const ggml_tensor * tensor, size_t size, bool save) {
     static const bool enabled = [] {
         const char * e = std::getenv("GGML_RPC_STATE_REF");
         return e != nullptr && std::atoi(e) != 0;
     }();
-    return enabled && size >= RPC_STATE_MIN_SIZE &&
-           (strncmp(tensor->name, "cache_k_l", 9) == 0 || strncmp(tensor->name, "cache_v_l", 9) == 0);
+    if (!enabled || size < RPC_STATE_MIN_SIZE) {
+        return false;
+    }
+    if (strncmp(tensor->name, "cache_k_l", 9) == 0 || strncmp(tensor->name, "cache_v_l", 9) == 0) {
+        return true;
+    }
+    return rpc_is_state_name(tensor->name) && (!save || rpc_state_ref_recurrent.load());
 }
 
 static bool rpc_state_ref_parse(const void * data, size_t size, rpc_state_ref_marker & m) {
@@ -813,7 +827,7 @@ static bool rpc_state_ref_parse(const void * data, size_t size, rpc_state_ref_ma
 template <typename D>
 static bool rpc_state_ref_restore(D * dispatcher, const rpc_tensor & rpc_tensor, const ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     rpc_state_ref_marker m;
-    if (!rpc_use_state_ref(tensor, size) || !rpc_state_ref_parse(data, size, m)) {
+    if (!rpc_use_state_ref(tensor, size, false) || !rpc_state_ref_parse(data, size, m)) {
         return false;
     }
     auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
@@ -832,7 +846,7 @@ static bool rpc_state_ref_restore(D * dispatcher, const rpc_tensor & rpc_tensor,
 
 template <typename D>
 static bool rpc_state_ref_save(D * dispatcher, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    if (!rpc_use_state_ref(tensor, size)) {
+    if (!rpc_use_state_ref(tensor, size, true)) {
         return false;
     }
     auto request = std::make_shared<rpc_msg_get_tensor_req>();
@@ -2723,6 +2737,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_state_ref_take_misses") == 0) { // PATCH(rpc-state-ref)
         return (void *)ggml_backend_rpc_state_ref_take_misses;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_state_ref_recurrent") == 0) { // PATCH(ckpt-rpc-ref)
+        return (void *)ggml_backend_rpc_state_ref_recurrent;
     }
     return NULL;
 
