@@ -1841,6 +1841,43 @@ private:
         return true;
     }
 
+    // PATCH(idle-slot-ttl): with a unified KV pool every decode attends over all occupied cells, so a slot that
+    // has been idle for a long time slows down every active session. LLAMA_IDLE_SLOT_TTL_S=N clears slots idle for
+    // more than N seconds, but only while another slot is working (a lone idle session keeps its cache). 0 = off.
+    void purge_stale_idle_slots() {
+        static const int64_t ttl_us = [] {
+            const char * e = getenv("LLAMA_IDLE_SLOT_TTL_S");
+            return e ? (int64_t) atoll(e) * 1000000 : (int64_t) 0;
+        }();
+        if (ttl_us <= 0 || !params_base.kv_unified) {
+            return;
+        }
+        static int64_t t_check = 0;
+        const int64_t t_now = ggml_time_us();
+        if (t_now - t_check < 1000000) {
+            return;
+        }
+        t_check = t_now;
+
+        bool any_active = false;
+        for (const auto & slot : slots) {
+            any_active = any_active || slot.is_processing();
+        }
+        if (!any_active) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0 || slot.t_last_used < 0) {
+                continue;
+            }
+            if (t_now - slot.t_last_used > ttl_us) {
+                SRV_WRN("idle-slot-ttl: clearing slot %d (%d tokens, idle %.0f s) - another slot is active\n",
+                        slot.id, (int) slot.prompt.n_tokens(), (t_now - slot.t_last_used) / 1e6);
+                slot.prompt_clear();
+            }
+        }
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
@@ -3057,6 +3094,8 @@ private:
 #endif
 
     void update_slots() {
+        purge_stale_idle_slots();
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
