@@ -1198,7 +1198,8 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    // returns false if the state could not be restored (e.g. referenced data gone from an RPC server)
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
