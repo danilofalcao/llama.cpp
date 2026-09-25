@@ -298,6 +298,8 @@ struct server_slot {
 
     server_prompt prompt;
 
+    bool xslot_waiting = false; // PATCH(xslot-prefix)
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -3213,6 +3215,44 @@ private:
                     const auto n_tokens_prev = batch.size();
 
                     // TODO: maybe move branch to outside of this loop in the future
+                    // PATCH(xslot-prefix): another slot is already processing the same prefix (two sessions of
+                    // the same agent started together) -> wait until it has a checkpoint we can copy, instead of
+                    // both computing the same tokens at half speed each
+                    if (slot.state == SLOT_STATE_STARTED && xslot_prefix_min() > 0 && slot.task->params.cache_prompt &&
+                            !input_tokens.has_mtmd && !slot.prompt.tokens.has_mtmd) {
+                        const int64_t own = slot.prompt.tokens.get_common_prefix(input_tokens);
+                        bool wait = false;
+                        for (const auto & other : slots) {
+                            if (other.id == slot.id || other.state != SLOT_STATE_PROCESSING_PROMPT || !other.task || other.task->tokens.has_mtmd) {
+                                continue;
+                            }
+                            const int64_t lcp = other.task->tokens.get_common_prefix(input_tokens);
+                            if (lcp < own + xslot_prefix_min()) {
+                                continue;
+                            }
+                            bool has_ckpt = false;
+                            for (const auto & c : other.prompt.checkpoints) {
+                                if (c.n_tokens >= own + xslot_prefix_min() && c.n_tokens <= lcp &&
+                                        c.n_tokens < (int64_t) input_tokens.size() && c.pos_max + 1 == c.n_tokens) {
+                                    has_ckpt = true;
+                                    break;
+                                }
+                            }
+                            if (!has_ckpt) {
+                                wait = true;
+                                break;
+                            }
+                        }
+                        if (wait) {
+                            if (!slot.xslot_waiting) {
+                                SLT_INF(slot, "%s", "xslot-prefix: another slot is processing the same prefix, waiting for its checkpoint\n");
+                                slot.xslot_waiting = true;
+                            }
+                            return;
+                        }
+                        slot.xslot_waiting = false;
+                    }
+
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
 
