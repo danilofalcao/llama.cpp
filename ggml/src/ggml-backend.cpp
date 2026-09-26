@@ -1590,10 +1590,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
+    int  changed_node = -1; // PATCH(sched-log-realloc)
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
             sched->bufts[sched->node_backend_ids[i]] != sched->bufts[sched->prev_node_backend_ids[i]]) {
             backend_ids_changed = true;
+            changed_node = i;
             break;
         }
     }
@@ -1609,6 +1611,22 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        // PATCH(sched-log-realloc): GGML_SCHED_LOG_REALLOC=1 logs every reallocation (each one synchronizes all backends)
+        static const bool log_realloc = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
+        if (log_realloc) {
+            if (changed_node >= 0) {
+                const ggml_tensor * n = sched->graph.nodes[changed_node];
+                GGML_LOG_WARN("%s: realloc (backend changed at node %d '%s' %s: %s -> %s), nodes=%d leafs=%d graph_size %d->%d\n", __func__,
+                    changed_node, n->name, ggml_op_desc(n),
+                    ggml_backend_name(sched->backends[sched->prev_node_backend_ids[changed_node]]),
+                    ggml_backend_name(sched->backends[sched->node_backend_ids[changed_node]]),
+                    sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_prev_graph_size, sched->debug_graph_size);
+            } else {
+                GGML_LOG_WARN("%s: realloc (%s), nodes=%d leafs=%d graph_size %d->%d\n", __func__,
+                    backend_ids_changed ? "leaf backend changed" : "gallocr needs realloc",
+                    sched->graph.n_nodes, sched->graph.n_leafs, sched->debug_prev_graph_size, sched->debug_graph_size);
+            }
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
