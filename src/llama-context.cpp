@@ -2603,6 +2603,26 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
+        // PATCH(xdev-act): pin the narrowing casts at a device boundary: xdev_out-<il> / xdev_in-<il> to the device of
+        // layer il, xdev_embd to the CPU (where the embeddings are gathered), xdev_head to the output device
+        if (strncmp(name, "xdev_", 5) == 0) {
+            ggml_backend_dev_t dev = nullptr;
+            if (strcmp(name, "xdev_embd") == 0) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            } else if (strcmp(name, "xdev_head") == 0) {
+                dev = model.dev_output();
+            } else if (il >= 0) {
+                dev = model.dev_layer(il);
+            }
+            for (const auto & backend : backends) {
+                if (dev != nullptr && ggml_backend_get_device(backend.get()) == dev && ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
+            return;
+        }
+
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
