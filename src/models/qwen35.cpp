@@ -1,6 +1,44 @@
 #include <cstdlib>
+#include <cstring>
 #include "models.h"
 #include "llama-memory-recurrent.h"
+
+// PATCH(xdev-act): LLAMA_XDEV_ACT=bf16|f16 narrows the hidden state wherever it crosses to another device
+// (input embeddings -> first layer, layer -> layer on another device, last layer -> output device). The
+// cast is pinned to the source device and the cast back to f32 to the destination device (see
+// llama_context::graph_get_cb), so only half the bytes cross - over RPC that is the network link.
+// bf16 is the model's native activation type, so this rounds the residual stream once per crossing,
+// exactly like native bf16 inference does after every layer. Unset = unchanged graph.
+static ggml_type qwen35_xdev_type() {
+    static const ggml_type t = [] {
+        const char * e = std::getenv("LLAMA_XDEV_ACT");
+        if (e == nullptr) {
+            return GGML_TYPE_COUNT;
+        }
+        if (std::strcmp(e, "bf16") == 0) {
+            return GGML_TYPE_BF16;
+        }
+        if (std::strcmp(e, "f16") == 0) {
+            return GGML_TYPE_F16;
+        }
+        if (std::strcmp(e, "f32") == 0) { // diagnostics: same graph shape, no narrowing
+            return GGML_TYPE_F32;
+        }
+        return GGML_TYPE_COUNT;
+    }();
+    return t;
+}
+
+// PATCH(xdev-act): only narrow ubatches with at least LLAMA_XDEV_MIN_TOKENS tokens (default 64): prompt
+// processing is bandwidth-bound on the link, while for small decode/verify batches the transfer is tiny
+// and the extra casts cost more than they save (measured +5 ms per MTP step at 5 tokens).
+static int64_t qwen35_xdev_min_tokens() {
+    static const int64_t n = [] {
+        const char * e = std::getenv("LLAMA_XDEV_MIN_TOKENS");
+        return e != nullptr ? (int64_t) std::atoll(e) : (int64_t) 64;
+    }();
+    return n;
+}
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -147,6 +185,23 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(inpL, "model.input_embed", -1);
 
+    // PATCH(xdev-act): embeddings are gathered on the CPU; narrow them before they cross to layer 0's device
+    // below the threshold keep the same nodes as an exact f32->f32 copy: a graph whose node count differs
+    // between decode and prompt ubatches makes ggml-alloc re-reserve for the current (small-KV) graph, after
+    // which every prompt ubatch reallocates - and each reallocation synchronizes all backends, which kills
+    // the RPC/local overlap (measured: prompt 960 -> 885 t/s instead of -> 1120).
+    ggml_type xdev_type = qwen35_xdev_type();
+    if (xdev_type != GGML_TYPE_COUNT && n_tokens < qwen35_xdev_min_tokens()) {
+        xdev_type = GGML_TYPE_F32;
+    }
+    if (xdev_type != GGML_TYPE_COUNT && n_layer > 0 &&
+        ggml_backend_dev_type(model.dev_layer(0)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        inpL = ggml_cast(ctx0, inpL, xdev_type);
+        cb(inpL, "xdev_embd", -1);
+        inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
+        cb(inpL, "xdev_in", 0);
+    }
+
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
@@ -154,6 +209,14 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
+        // PATCH(xdev-act): device boundary between layer il-1 and layer il
+        if (xdev_type != GGML_TYPE_COUNT && il > 0 && model.dev_layer(il) != model.dev_layer(il - 1)) {
+            inpL = ggml_cast(ctx0, inpL, xdev_type);
+            cb(inpL, "xdev_out", il - 1);
+            inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
+            cb(inpL, "xdev_in", il);
+        }
+
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -201,6 +264,13 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         // Input for next layer
         inpL = cur;
+    }
+    // PATCH(xdev-act): last layer and output head on different devices
+    if (xdev_type != GGML_TYPE_COUNT && n_layer > 0 && model.dev_output() != model.dev_layer(n_layer - 1)) {
+        inpL = ggml_cast(ctx0, inpL, xdev_type);
+        cb(inpL, "xdev_out", n_layer - 1);
+        inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
+        cb(inpL, "xdev_head", -1);
     }
     cur = inpL;
 
