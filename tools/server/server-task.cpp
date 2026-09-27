@@ -1826,39 +1826,43 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
+        // PATCH(slot-swap): keep the entry intact until both target and draft are restored, so a failed load (no
+        // free cells in the pool) can be retried after the caller made room
+        const int64_t t_load0 = ggml_time_us();
 
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+        auto & data_main = it_best->data.main;
+        auto & data_drft = it_best->data.drft;
+
+        {
+            const size_t size = data_main.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data_main.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_WRN("failed to restore state with size %zu\n", size);
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
-        {
-            auto & data = it_best->data.drft;
+        if (!data_drft.empty()) {
+            GGML_ASSERT(ctx_dft);
 
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
+            const size_t size = data_drft.size();
+            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data_drft.data(), size, id_slot, 0);
+            if (n != size) {
+                SRV_WRN("failed to restore draft state with size %zu\n", size);
 
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
+                return false;
             }
         }
+
+        SRV_INF("slot-swap: restored %zu tokens from the RAM cache into slot %d in %.0f ms (%.0f MiB)\n",
+                it_best->prompt.tokens.size(), id_slot, (ggml_time_us() - t_load0) / 1000.0,
+                (data_main.size() + data_drft.size()) / (1024.0 * 1024.0));
+
+        data_main.clear();
+        data_main.shrink_to_fit();
+        data_drft.clear();
+        data_drft.shrink_to_fit();
 
         loaded_spec = std::move(it_best->data.spec); // PATCH(mtp-state)
 
