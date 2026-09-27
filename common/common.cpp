@@ -2339,22 +2339,25 @@ bool common_prompt_checkpoint::load_tgt(
     return true;
 }
 
-void common_prompt_checkpoint::load_dft(
+bool common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
-        return;
+        return true;
     }
 
     if (data_dft.empty()) {
-        return;
+        return true;
     }
 
+    // PATCH(dft-restore): e.g. the draft KV pool has no room for the restored cells - let the caller fall back
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+        LOG_WRN("%s: draft checkpoint restore failed: expected %zu, got %zu\n", __func__, data_dft.size(), n);
+        return false;
     }
+    return true;
 }
 
 void common_prompt_checkpoint::clear_tgt() {

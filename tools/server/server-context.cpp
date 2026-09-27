@@ -1384,6 +1384,7 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            SRV_INF("draft context seq_rm type = %d (0 = none, 1 = partial, 2 = full only, 3 = bounded)\n", (int) ctx_dft_seq_rm_type);
         }
 
         if (spec) {
@@ -3364,7 +3365,9 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (!ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                        GGML_ABORT("failed to restore the draft speculative checkpoint of slot %d\n", slot.id);
+                    }
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -3637,13 +3640,24 @@ private:
                                         const int64_t n_copy = ck->n_tokens;
                                         slot.mem.seq_rm(slot.id, -1, -1);
                                         slot.mem.seq_cp(src->id, slot.id, 0, (llama_pos) n_copy);
-                                        if (!ck->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
-                                            SLT_WRN(slot, "xslot-prefix: checkpoint of slot %d is no longer available, re-processing the prompt\n", src->id);
+                                        // PATCH(dft-restore): seq_cp above already shares the draft cells of [0, n_copy) with the
+                                        // source slot. A draft memory with partial seq_rm (plain KV, e.g. MTP) holds nothing else, and
+                                        // restoring its checkpoint would need n_copy *fresh* cells (seq_rm does not free cells that are
+                                        // still shared with the source) - in a nearly full unified pool that fails. Only restore the
+                                        // draft when its state is not purely positional.
+                                        const bool xs_need_dft = ctx_dft != nullptr && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+                                        const bool xs_ok_tgt   = ck->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const bool xs_ok_dft   = xs_ok_tgt && (!xs_need_dft || ck->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                                        if (!xs_ok_tgt || !xs_ok_dft) {
+                                            if (!xs_ok_tgt) {
+                                                SLT_WRN(slot, "xslot-prefix: checkpoint of slot %d is no longer available, re-processing the prompt\n", src->id);
+                                            } else {
+                                                SLT_WRN(slot, "xslot-prefix: draft checkpoint of slot %d could not be restored, re-processing the prompt\n", src->id);
+                                            }
                                             slot.mem.seq_rm(slot.id, -1, -1);
                                             slot.prompt.clear();
                                             n_past = 0;
                                         } else {
-                                        ck->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         common_speculative_set_state(spec.get(), slot.id, ck->data_spec);
                                         slot.prompt.tokens = src->prompt.tokens.clone();
                                         slot.prompt.tokens.keep_first(n_copy);
@@ -3806,10 +3820,16 @@ private:
                                         // PATCH(ckpt-rpc-ref): referenced state gone from the RPC server -> the sequence was cleared
                                         SLT_WRN(slot, "%s", "context checkpoint no longer available on the RPC server, re-processing the prompt\n");
                                         do_reset = true;
+                                    } else if (!do_reset && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                                               !it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                        // PATCH(dft-restore): the draft state could not be restored (e.g. no free cells in the draft KV pool)
+                                        SLT_WRN(slot, "%s", "draft checkpoint could not be restored, re-processing the prompt\n");
+                                        do_reset = true;
                                     } else if (!do_reset) {
                                         // restore the context checkpoint (target state loaded above)
+                                        // PATCH(dft-restore): a draft with partial seq_rm (plain KV) keeps its cells for [0, n_past) and is
+                                        // trimmed below like the target - restoring it would only rewrite them and needs fresh cells
                                         SLT_INF(slot, "checkpoint restored at n_tokens = %" PRId64 " in %.0f ms\n", it->n_tokens, (ggml_time_us() - t_rest0) / 1000.0);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
@@ -4446,8 +4466,8 @@ private:
                             GGML_ABORT("failed to restore speculative checkpoint");
                         }
 
-                        if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (slot.ctx_dft && !ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                            GGML_ABORT("failed to restore the draft speculative checkpoint of slot %d\n", slot.id);
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
