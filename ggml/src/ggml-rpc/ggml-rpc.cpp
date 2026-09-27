@@ -1548,6 +1548,7 @@ private:
         std::list<uint64_t>::iterator lru;
     };
     bool state_cache_put(uint64_t hash, std::vector<uint8_t> data);
+    void state_disk_put(uint64_t hash, const std::vector<uint8_t> & data); // PATCH(state-disk)
     std::unordered_map<uint64_t, state_entry> state_cache;
     std::list<uint64_t> state_cache_order;
     size_t state_cache_bytes  = 0;
@@ -1930,6 +1931,72 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     return true;
 }
 
+// PATCH(state-disk): persist state regions to cache_dir/state/<hash> so that a
+// GGML-RPC-REF marker still resolves after the server process restarts. Bounded by
+// GGML_RPC_STATE_DISK_MB (0 = off); evicts the oldest by mtime when over budget.
+static size_t rpc_state_disk_budget_bytes() {
+    static const size_t v = [] {
+        const char * e = std::getenv("GGML_RPC_STATE_DISK_MB");
+        const long long mb = e ? atoll(e) : 0;
+        return (size_t) (mb > 0 ? mb : 0) * 1024ull * 1024ull;
+    }();
+    return v;
+}
+
+void rpc_server::state_disk_put(uint64_t hash, const std::vector<uint8_t> & data) {
+    const size_t budget = rpc_state_disk_budget_bytes();
+    if (!cache_dir || budget == 0 || data.empty() || data.size() > budget) {
+        return;
+    }
+    std::error_code ec;
+    fs::path dir = fs::path(cache_dir) / "state";
+    fs::create_directories(dir, ec);
+    if (ec) {
+        return;
+    }
+    char hash_str[17];
+    snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
+    fs::path file = dir / hash_str;
+    if (fs::exists(file, ec)) {
+        fs::last_write_time(file, fs::file_time_type::clock::now(), ec);
+        return;
+    }
+    size_t used = 0;
+    std::vector<std::pair<fs::file_time_type, std::pair<fs::path, size_t> > > entries;
+    for (const auto & de : fs::directory_iterator(dir, ec)) {
+        if (ec || !de.is_regular_file(ec)) {
+            continue;
+        }
+        const size_t sz = (size_t) de.file_size(ec);
+        used += sz;
+        entries.push_back(std::make_pair(fs::last_write_time(de.path(), ec), std::make_pair(de.path(), sz)));
+    }
+    if (used + data.size() > budget) {
+        std::sort(entries.begin(), entries.end());
+        for (const auto & e : entries) {
+            if (used + data.size() <= budget) {
+                break;
+            }
+            std::error_code rec;
+            if (fs::remove(e.second.first, rec)) {
+                used -= e.second.second;
+                GGML_LOG_INFO("[%s] evicted state region %s (%zu bytes) to stay within the disk budget\n",
+                              __func__, e.second.first.filename().string().c_str(), e.second.second);
+            }
+        }
+    }
+    std::ofstream ofs(file, std::ios::binary);
+    ofs.write((const char *) data.data(), data.size());
+    if (!ofs.good()) {
+        fs::remove(file, ec);
+        return;
+    }
+    GGML_LOG_INFO("[%s] persisted state region %s (%zu bytes) - state cache on disk: %zu files, %zu MiB (budget %zu MiB, GGML_RPC_STATE_DISK_MB)\n",
+                  __func__, hash_str, data.size(),
+                  (size_t) std::distance(fs::directory_iterator(dir, ec), fs::directory_iterator()),
+                  (used + data.size()) / 1024 / 1024, budget / 1024 / 1024);
+}
+
 // PATCH(rpc-state-cache): FIFO-bounded RAM cache
 bool rpc_server::state_cache_put(uint64_t hash, std::vector<uint8_t> data) {
     auto hit = state_cache.find(hash);
@@ -1960,18 +2027,26 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     }
     char hash_str[17];
     snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-    fs::path cache_file = fs::path(cache_dir) / hash_str;
-    std::error_code ec;
-    if (!fs::exists(cache_file, ec)) {
-        return false;
+    // PATCH(state-disk): state regions live in cache_dir/state, weights in cache_dir
+    const fs::path candidates[2] = { fs::path(cache_dir) / "state" / hash_str, fs::path(cache_dir) / hash_str };
+    for (const fs::path & cache_file : candidates) {
+        std::error_code ec;
+        if (!fs::exists(cache_file, ec)) {
+            continue;
+        }
+        std::ifstream ifs(cache_file, std::ios::binary);
+        if (!ifs) {
+            continue;
+        }
+        fs::last_write_time(cache_file, fs::file_time_type::clock::now(), ec); // PATCH(state-disk): LRU on hit
+        ifs.seekg(0, std::ios::end);
+        size_t size = (size_t) ifs.tellg();
+        ifs.seekg(0, std::ios::beg);
+        data.resize(size);
+        ifs.read((char *)data.data(), size);
+        return true;
     }
-    std::ifstream ifs(cache_file, std::ios::binary);
-    ifs.seekg(0, std::ios::end);
-    size_t size = ifs.tellg();
-    ifs.seekg(0, std::ios::beg);
-    data.resize(size);
-    ifs.read((char *)data.data(), size);
-    return true;
+    return false;
 }
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
@@ -2130,6 +2205,7 @@ bool rpc_server::get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_
     std::vector<uint8_t> data(request.size);
     ggml_backend_tensor_get(tensor, data.data(), request.offset, request.size);
     const uint64_t hash = rpc_state_hash(data.data(), data.size());
+    state_disk_put(hash, data); // PATCH(state-disk)
     if (state_cache_put(hash, std::move(data))) {
         response.hash   = hash;
         response.result = 1;
