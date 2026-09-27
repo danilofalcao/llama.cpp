@@ -1204,7 +1204,8 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    // PATCH(dft-restore): returns false instead of aborting when the draft state cannot be restored
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
