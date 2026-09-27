@@ -1697,6 +1697,12 @@ private:
                 selected_by_cost = true;
                 SLT_INF(*ret, "selected slot by cache cost: reuse %" PRId64 " of %zu cached tokens (discard %" PRId64 ")\n",
                         best_lcp, ret->prompt.tokens.size(), (int64_t) ret->prompt.tokens.size() - best_lcp);
+
+                // PATCH(slot-swap): with the RAM prompt cache (--cache-ram), stash what this slot is about to lose and
+                // look for a cached state of the new prompt. A slot that mostly continues (keeps >= 50%) is left
+                // alone - saving it would copy its whole state on every turn.
+                const size_t n_cached = ret->prompt.tokens.size();
+                update_cache = n_cached == 0 || float(best_lcp) / n_cached < 0.5f;
             }
         }
 
@@ -1789,7 +1795,19 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+
+                // PATCH(slot-swap): the cached state needs free cells in the unified pool (target and draft). If other
+                // idle slots hold them, move the least recently used one to the RAM cache and try again.
+                while (!loaded) {
+                    ret->prompt_clear();
+                    if (!try_clear_idle_slots(ret)) {
+                        break;
+                    }
+                    loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                }
+
+                if (!loaded) {
                     ret->prompt_clear();
                 }
 
@@ -1874,7 +1892,7 @@ private:
             if (t_now - slot.t_last_used > ttl_us) {
                 SRV_WRN("idle-slot-ttl: clearing slot %d (%d tokens, idle %.0f s) - another slot is active\n",
                         slot.id, (int) slot.prompt.n_tokens(), (t_now - slot.t_last_used) / 1e6);
-                slot.prompt_clear();
+                slot_evict(slot); // PATCH(slot-swap)
             }
         }
     }
@@ -1884,31 +1902,48 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
-        bool res = false;
-
+    // PATCH(slot-swap): clear the least recently used idle slot (not the lowest id) and, with --cache-ram, move its
+    // state to the RAM prompt cache first, so the conversation comes back with a state copy instead of a re-prefill
+    bool try_clear_idle_slots(const server_slot * keep = nullptr) {
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
 
+        server_slot * lru = nullptr;
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (&slot == keep || slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
-
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (lru == nullptr || slot.t_last_used < lru->t_last_used) {
+                lru = &slot;
             }
         }
 
-        return res;
+        if (lru == nullptr) {
+            return false;
+        }
+
+        SRV_WRN("purging slot %d with %zu tokens\n", lru->id, lru->prompt.tokens.size());
+
+        // clear slots one by one
+        slot_evict(*lru);
+
+        return true;
+    }
+
+    // PATCH(slot-swap): move an idle slot's state to the RAM prompt cache (if enabled), then clear it
+    void slot_evict(server_slot & slot) {
+        if (prompt_cache && slot.prompt.n_tokens() > 0) {
+            const int64_t t0 = ggml_time_us();
+            const int     n  = slot.prompt.n_tokens();
+            if (slot.prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+                SLT_INF(slot, "slot-swap: saved %d tokens to the RAM cache in %.0f ms (cache: %zu prompts, %.0f MiB)\n",
+                        n, (ggml_time_us() - t0) / 1000.0, prompt_cache->states.size(), prompt_cache->size() / (1024.0 * 1024.0));
+            }
+        }
+
+        slot.prompt_clear();
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2589,7 +2624,11 @@ private:
         ckpt_rpc_ref(true);
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         ckpt_rpc_ref(false);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // PATCH(dft-restore): a draft with partial seq_rm keeps its own cells and is never restored from a prompt
+        // checkpoint (see the restore paths), so its whole KV is not copied into every checkpoint
+        if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         SLT_INF(slot, "checkpoint saved at n_tokens = %" PRId64 " in %.0f ms\n", cur.n_tokens, (ggml_time_us() - t_ckpt0) / 1000.0);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
