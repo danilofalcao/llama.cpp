@@ -85,6 +85,7 @@ enum rpc_cmd {
     RPC_CMD_GET_TENSOR_REF,   // PATCH(rpc-state-ref)
     RPC_CMD_GRAPH_COMPUTE_STORE,  // PATCH(rpc-graph-cache)
     RPC_CMD_GRAPH_RECOMPUTE_KEY,  // PATCH(rpc-graph-cache)
+    RPC_CMD_SET_TENSOR_HASH_RANGE, // PATCH(state-ref-split)
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -182,6 +183,15 @@ struct rpc_msg_set_tensor_hash_req {
 
 struct rpc_msg_set_tensor_hash_rsp {
     uint8_t result;
+};
+
+// PATCH(state-ref-split): write bytes [src_offset, src_offset + size) of a region kept on the server
+struct rpc_msg_set_tensor_hash_range_req {
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t hash;
+    uint64_t src_offset;
+    uint64_t size;
 };
 
 // PATCH(rpc-state-ref)
@@ -875,19 +885,82 @@ static bool rpc_state_ref_parse(const void * data, size_t size, rpc_state_ref_ma
 // Marker bytes never reach the device as KV data, and the result is byte-for-byte what a save of
 // real bytes would have restored.
 // Returns false if the slice holds no marker at all (plain bytes: the caller sends them as usual).
+// PATCH(state-ref-split): a region that does not fit in the current destination run is no longer a
+// miss. Its first part is written from the server-side copy (RPC_CMD_SET_TENSOR_HASH_RANGE) and the
+// rest is remembered here; the next slice of the same tensor (the next destination run) starts with
+// the continuation of that region in the saved stream, so it is taken from the server copy too
+// (those stream bytes are only the zero filler written by rpc_state_ref_save).
+struct rpc_state_ref_pending_t {
+    const ggml_tensor * tensor = nullptr;
+    uint64_t hash = 0;
+    uint64_t size = 0;
+    uint64_t done = 0;
+};
+static rpc_state_ref_pending_t rpc_state_ref_pending;
+
+template <typename D>
+static bool rpc_state_ref_send_range(D * dispatcher, const rpc_tensor & rpc_tensor, const ggml_tensor * tensor,
+                                     size_t dst_offset, uint64_t hash, uint64_t src_offset, uint64_t n) {
+    auto request = std::make_shared<rpc_msg_set_tensor_hash_range_req>();
+    request->tensor     = rpc_tensor;
+    request->offset     = dst_offset;
+    request->hash       = hash;
+    request->src_offset = src_offset;
+    request->size       = n;
+    rpc_msg_set_tensor_hash_rsp response;
+    dispatcher->send(RPC_CMD_SET_TENSOR_HASH_RANGE, request, sizeof(*request), &response, sizeof(response));
+    if (!response.result) {
+        rpc_state_ref_misses++;
+        GGML_LOG_ERROR("%s: state region %s (+%zu, part %" PRIu64 "+%" PRIu64 ", hash %016" PRIx64 ") is no longer on the server\n",
+                       __func__, tensor->name, dst_offset, src_offset, n, hash);
+        return false;
+    }
+    return true;
+}
+
 template <typename D>
 static bool rpc_state_ref_restore(D * dispatcher, const rpc_tensor & rpc_tensor, const ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    if (!rpc_use_state_ref(tensor, RPC_STATE_MIN_SIZE, false) || size < sizeof(rpc_state_ref_marker)) {
+    if (!rpc_use_state_ref(tensor, RPC_STATE_MIN_SIZE, false)) {
         return false;
     }
     const uint8_t * base      = (const uint8_t *) data;
     const uint8_t * end       = base + size;
+    const uint8_t * start     = base;
+    if (rpc_state_ref_pending.tensor != nullptr) {
+        auto & pd = rpc_state_ref_pending;
+        if (pd.tensor != tensor) {
+            rpc_state_ref_misses++;
+            GGML_LOG_WARN("%s: state region split across runs of %s was not completed (%" PRIu64 " of %" PRIu64 " bytes) - forcing re-process\n",
+                          __func__, pd.tensor->name, pd.done, pd.size);
+            pd = rpc_state_ref_pending_t();
+        } else {
+            const uint64_t n = std::min<uint64_t>(size, pd.size - pd.done);
+            rpc_state_ref_send_range(dispatcher, rpc_tensor, tensor, offset, pd.hash, pd.done, n);
+            pd.done += n;
+            start   += n;
+            if (pd.done == pd.size) {
+                pd = rpc_state_ref_pending_t();
+            }
+            if (start == end) {
+                return true;
+            }
+        }
+    }
+    if ((size_t) (end - start) < sizeof(rpc_state_ref_marker)) {
+        if (start == base) {
+            return false;
+        }
+        size_t input_size;
+        auto input = serialize_set_tensor(rpc_tensor, 0, offset + (size_t) (start - base), start, (size_t) (end - start), input_size);
+        dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+        return true;
+    }
     const uint8_t * magic     = (const uint8_t *) RPC_STATE_REF_MAGIC;
     const uint8_t * magic_end = magic + sizeof(RPC_STATE_REF_MAGIC);
     auto next_marker = [&](const uint8_t * from) {
         return std::search(from, end, magic, magic_end);
     };
-    if (next_marker(base) == end) {
+    if (start == base && next_marker(base) == end) {
         return false; // real bytes only
     }
     auto send_raw = [&](const uint8_t * from, const uint8_t * to) {
@@ -898,7 +971,7 @@ static bool rpc_state_ref_restore(D * dispatcher, const rpc_tensor & rpc_tensor,
         auto input = serialize_set_tensor(rpc_tensor, 0, offset + (size_t) (from - base), from, (size_t) (to - from), input_size);
         dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
     };
-    const uint8_t * cur = base;
+    const uint8_t * cur = start;
     while (cur < end) {
         const uint8_t * mk = next_marker(cur);
         send_raw(cur, mk);
@@ -915,7 +988,18 @@ static bool rpc_state_ref_restore(D * dispatcher, const rpc_tensor & rpc_tensor,
             break;
         }
         memcpy(&m, mk, sizeof(m));
-        if (m.size < sizeof(m) || m.size > left) {
+        if (m.size >= sizeof(m) && m.size > left) {
+            // PATCH(state-ref-split): the region continues in the next destination run
+            GGML_LOG_INFO("%s: state region %s (+%zu, %" PRIu64 " bytes) spans destination runs - restoring it in parts\n",
+                          __func__, tensor->name, offset + at, m.size);
+            rpc_state_ref_send_range(dispatcher, rpc_tensor, tensor, offset + at, m.hash, 0, left);
+            rpc_state_ref_pending.tensor = tensor;
+            rpc_state_ref_pending.hash   = m.hash;
+            rpc_state_ref_pending.size   = m.size;
+            rpc_state_ref_pending.done   = left;
+            break;
+        }
+        if (m.size < sizeof(m)) {
             rpc_state_ref_misses++;
             GGML_LOG_WARN("%s: state region %s (+%zu) restored in a different layout than saved (%" PRIu64 " bytes, %zu left in this run) - forcing re-process\n",
                           __func__, tensor->name, offset + at, m.size, left);
@@ -965,6 +1049,12 @@ static bool rpc_state_ref_save(D * dispatcher, const ggml_tensor * tensor, void 
 }
 
 static int ggml_backend_rpc_state_ref_take_misses(void) {
+    if (rpc_state_ref_pending.tensor != nullptr) { // PATCH(state-ref-split)
+        GGML_LOG_WARN("%s: state region split across runs of %s was not completed - forcing re-process\n",
+                      __func__, rpc_state_ref_pending.tensor->name);
+        rpc_state_ref_pending = rpc_state_ref_pending_t();
+        rpc_state_ref_misses++;
+    }
     return rpc_state_ref_misses.exchange(0);
 }
 
@@ -1580,6 +1670,7 @@ public:
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_rle(const std::vector<uint8_t> & input); // PATCH(rpc-mask-rle)
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool set_tensor_hash_range(const rpc_msg_set_tensor_hash_range_req & request, rpc_msg_set_tensor_hash_rsp & response); // PATCH(state-ref-split)
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response); // PATCH(rpc-state-ref)
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -2159,6 +2250,55 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         }
     }
     ggml_backend_tensor_set(tensor, src_data, request.offset, size);
+    response.result = 1;
+    return true;
+}
+
+// PATCH(state-ref-split): like set_tensor_hash, but writes only a sub-range of the stored region
+bool rpc_server::set_tensor_hash_range(const rpc_msg_set_tensor_hash_range_req & request, rpc_msg_set_tensor_hash_rsp & response)
+{
+    response.result = 0;
+    std::vector<uint8_t> cached_file;
+    const uint8_t * src_data = nullptr;
+    size_t src_size = 0;
+    auto sc = state_cache.find(request.hash);
+    if (sc != state_cache.end()) {
+        state_cache_order.splice(state_cache_order.end(), state_cache_order, sc->second.lru);
+        src_data = sc->second.data.data();
+        src_size = sc->second.data.size();
+    } else if (get_cached_file(request.hash, cached_file)) {
+        src_data = cached_file.data();
+        src_size = cached_file.size();
+    } else {
+        return true;
+    }
+    if (request.src_offset > src_size || request.size > src_size - request.src_offset) {
+        GGML_LOG_ERROR("[%s] range %" PRIu64 "+%" PRIu64 " outside region of %zu bytes\n", __func__, request.src_offset, request.size, src_size);
+        return true;
+    }
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return false;
+    }
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (request.tensor.data + request.offset < p0
+         || request.tensor.data + request.offset >= p1
+         || request.size > (p1 - request.tensor.data - request.offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region out of buffer bounds\n", __func__);
+            return false;
+        }
+    }
+    ggml_backend_tensor_set(tensor, src_data + request.src_offset, request.offset, request.size);
     response.result = 1;
     return true;
 }
@@ -2797,6 +2937,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor_rle(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_HASH_RANGE: { // PATCH(state-ref-split)
+                rpc_msg_set_tensor_hash_range_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_set_tensor_hash_rsp response;
+                if (!server.set_tensor_hash_range(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
