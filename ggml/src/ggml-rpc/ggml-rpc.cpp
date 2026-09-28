@@ -858,22 +858,81 @@ static bool rpc_state_ref_parse(const void * data, size_t size, rpc_state_ref_ma
 }
 
 // returns true if the request was fully handled (marker restored, or a miss was recorded)
+// PATCH(state-ref-layout): restore of a KV/state slice that may carry state-ref markers.
+//
+// A marker {magic, hash, size} stands for a region kept on the RPC server. The bytes of a restored
+// slice follow the layout of the SAVE (the saved cell ranges one after the other), while the slice
+// boundaries follow the layout of the RESTORE (the destination cell runs). They differ whenever a
+// fragmented sequence is restored into a fresh or differently fragmented pool: a slice can then hold
+// several markers, and a marker can sit anywhere in it - not only at its start (e.g. after a small
+// range that was saved as real bytes). 606c4a638 (local/qwen-cluster-v050) only looked at the start
+// of the slice, so a marker further in was still written to the device as KV data. Here the whole
+// slice is walked:
+//   - every marker whose region fits in the slice is restored from the RPC server at its own offset,
+//   - the bytes between markers are sent as they are,
+//   - a region that does not fit (it continues in another destination run) is a miss, so the load
+//     fails (take_misses) and the server re-processes the prompt; its tail is never written.
+// Marker bytes never reach the device as KV data, and the result is byte-for-byte what a save of
+// real bytes would have restored.
+// Returns false if the slice holds no marker at all (plain bytes: the caller sends them as usual).
 template <typename D>
 static bool rpc_state_ref_restore(D * dispatcher, const rpc_tensor & rpc_tensor, const ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    rpc_state_ref_marker m;
-    if (!rpc_use_state_ref(tensor, size, false) || !rpc_state_ref_parse(data, size, m)) {
+    if (!rpc_use_state_ref(tensor, RPC_STATE_MIN_SIZE, false) || size < sizeof(rpc_state_ref_marker)) {
         return false;
     }
-    auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
-    request->tensor = rpc_tensor;
-    request->offset = offset;
-    request->hash   = m.hash;
-    rpc_msg_set_tensor_hash_rsp response;
-    dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
-    if (!response.result) {
-        rpc_state_ref_misses++;
-        GGML_LOG_ERROR("%s: state region %s (+%zu, %zu bytes, hash %016" PRIx64 ") is no longer on the server\n",
-                       __func__, tensor->name, offset, size, m.hash);
+    const uint8_t * base      = (const uint8_t *) data;
+    const uint8_t * end       = base + size;
+    const uint8_t * magic     = (const uint8_t *) RPC_STATE_REF_MAGIC;
+    const uint8_t * magic_end = magic + sizeof(RPC_STATE_REF_MAGIC);
+    auto next_marker = [&](const uint8_t * from) {
+        return std::search(from, end, magic, magic_end);
+    };
+    if (next_marker(base) == end) {
+        return false; // real bytes only
+    }
+    auto send_raw = [&](const uint8_t * from, const uint8_t * to) {
+        if (to <= from) {
+            return;
+        }
+        size_t input_size;
+        auto input = serialize_set_tensor(rpc_tensor, 0, offset + (size_t) (from - base), from, (size_t) (to - from), input_size);
+        dispatcher->send(RPC_CMD_SET_TENSOR, input, input_size);
+    };
+    const uint8_t * cur = base;
+    while (cur < end) {
+        const uint8_t * mk = next_marker(cur);
+        send_raw(cur, mk);
+        if (mk == end) {
+            break;
+        }
+        const size_t at   = (size_t) (mk - base);
+        const size_t left = size - at;
+        rpc_state_ref_marker m;
+        if (left < sizeof(m)) {
+            rpc_state_ref_misses++;
+            GGML_LOG_WARN("%s: state region %s (+%zu) restored in a different layout than saved (truncated marker) - forcing re-process\n",
+                          __func__, tensor->name, offset + at);
+            break;
+        }
+        memcpy(&m, mk, sizeof(m));
+        if (m.size < sizeof(m) || m.size > left) {
+            rpc_state_ref_misses++;
+            GGML_LOG_WARN("%s: state region %s (+%zu) restored in a different layout than saved (%" PRIu64 " bytes, %zu left in this run) - forcing re-process\n",
+                          __func__, tensor->name, offset + at, m.size, left);
+            break;
+        }
+        auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
+        request->tensor = rpc_tensor;
+        request->offset = offset + at;
+        request->hash   = m.hash;
+        rpc_msg_set_tensor_hash_rsp response;
+        dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
+        if (!response.result) {
+            rpc_state_ref_misses++;
+            GGML_LOG_ERROR("%s: state region %s (+%zu, %" PRIu64 " bytes, hash %016" PRIx64 ") is no longer on the server\n",
+                           __func__, tensor->name, offset + at, m.size, m.hash);
+        }
+        cur = mk + m.size;
     }
     return true;
 }
@@ -897,6 +956,11 @@ static bool rpc_state_ref_save(D * dispatcher, const ggml_tensor * tensor, void 
     m.hash = response.hash;
     m.size = size;
     memcpy(data, &m, sizeof(m));
+    // PATCH(state-ref-layout): the rest of the region would otherwise keep leftover bytes from the
+    // caller's reused buffer, which a restore in a different layout could write to the device as KV
+    if (size > sizeof(m)) {
+        memset((uint8_t *) data + sizeof(m), 0, size - sizeof(m));
+    }
     return true;
 }
 

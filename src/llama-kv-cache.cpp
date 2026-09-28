@@ -1052,6 +1052,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             head_cur = 0;
         }
 
+        // PATCH(kv-first-fit): LLAMA_KV_FIRST_FIT=1 always takes the lowest free cells. Attention covers the cells
+        // [0, used_max_p1) of the whole stream, so with several sequences in a unified cache a sequence that grows
+        // past the others lands at the end of the used range and every sequence then pays for the holes
+        // (e.g. a 13K conversation attending over 112K cells). Filling the lowest holes first keeps used_max_p1
+        // close to the number of used cells. Not for SWA caches (they rely on the head for ring reuse).
+        static const bool kv_first_fit = [] {
+            const char * e = getenv("LLAMA_KV_FIRST_FIT");
+            return e && atoi(e) != 0;
+        }();
+        if (kv_first_fit && n_swa == 0) {
+            head_cur = 0;
+        }
+
         if (n_tokens > cells.size()) {
             LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
             return { };

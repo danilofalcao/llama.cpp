@@ -80,7 +80,18 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    // PATCH(mtp-head-rows): a standalone MTP draft GGUF may carry an LM head that keeps only the first K rows
+    // (see LLAMA_MTP_DRAFT_VOCAB in build_mtp: the draft never scores the other rows anyway). Accept it as is,
+    // so the dropped rows are not loaded into VRAM; build_mtp pads the logits back to n_vocab.
+    int64_t n_vocab_head = n_vocab;
+    if (mtp_only) {
+        const ggml_tensor * out_meta = ml.get_tensor_meta(tn(LLM_TENSOR_OUTPUT, "weight").str().c_str());
+        if (out_meta && out_meta->ne[0] == n_embd && out_meta->ne[1] > 0 && out_meta->ne[1] < n_vocab) {
+            n_vocab_head = out_meta->ne[1];
+            LLAMA_LOG_INFO("%s: MTP draft LM head keeps %lld of %lld vocab rows\n", __func__, (long long) n_vocab_head, (long long) n_vocab);
+        }
+    }
+    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_head }, TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
@@ -718,12 +729,23 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         const char * e = std::getenv("LLAMA_MTP_DRAFT_VOCAB");
         return e ? (int64_t) std::atoll(e) : (int64_t) 0;
     }();
+    // PATCH(mtp-head-rows): the head may itself be truncated to its first rows (standalone draft GGUF)
+    const int64_t n_vocab_full = (int64_t) model.vocab.n_tokens();
     const int64_t n_vocab_head = head_w->ne[1];
-    if (mtp_draft_vocab > 0 && mtp_draft_vocab < n_vocab_head && head_s == nullptr && !ggml_is_transposed(head_w)) {
-        ggml_tensor * head_k = ggml_view_2d(ctx0, head_w, head_w->ne[0], mtp_draft_vocab, head_w->nb[1], 0);
+    int64_t n_rows_used = n_vocab_head;
+    if (mtp_draft_vocab > 0 && mtp_draft_vocab < n_rows_used) {
+        n_rows_used = mtp_draft_vocab;
+    }
+    if (n_vocab_head == n_vocab_full && (head_s != nullptr || ggml_is_transposed(head_w))) {
+        n_rows_used = n_vocab_full; // the row view needs a plain weight: upstream path
+    }
+    if (n_rows_used < n_vocab_full) {
+        GGML_ASSERT(head_s == nullptr && !ggml_is_transposed(head_w) && "QWEN35 MTP: truncated LM head needs a plain weight");
+        ggml_tensor * head_k = n_rows_used == n_vocab_head ? head_w :
+            ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows_used, head_w->nb[1], 0);
         cur = ggml_mul_mat(ctx0, head_k, cur);
         cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
-        cur = ggml_pad(ctx0, cur, (int) (n_vocab_head - mtp_draft_vocab), 0, 0, 0);
+        cur = ggml_pad(ctx0, cur, (int) (n_vocab_full - n_rows_used), 0, 0, 0);
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }

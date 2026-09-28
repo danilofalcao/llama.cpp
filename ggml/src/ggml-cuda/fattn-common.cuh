@@ -50,8 +50,53 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// PATCH(fa-kv-chunk): the kernels for large batches (MMA) read K/V as F16, so a quantized KV cache is converted to
+// F16 before the launch. Upstream converts the whole K/V view, i.e. the scratch space in the compute buffer grows
+// with the context: n_kv * n_embd_k_gqa * 2 bytes for K and again for V, 512 MiB per device at 128K tokens with a
+// 4x256 head layout and 1 GiB at 256K - reserved once per llama_context (target and draft alike) and larger than
+// the q4_0 KV cache itself. With GGML_CUDA_FA_KV_CHUNK=N (default 16384, 0 = upstream) the MMA launcher instead
+// walks the KV cache in chunks of N cells: convert a chunk, run the kernel on it with one CUDA block per output tile
+// (the kernel then exports the per-row KQ max and rowsum), and merge the partial results with the usual
+// online-softmax rule. The result is the same attention; the F16 scratch space is bounded by N cells.
+static int64_t ggml_cuda_fattn_kv_chunk_env() {
+    static const int64_t chunk = [] {
+        const char * e = getenv("GGML_CUDA_FA_KV_CHUNK");
+        int64_t c = e ? (int64_t) atoll(e) : (int64_t) 16384;
+        if (c <= 0) {
+            return (int64_t) 0;
+        }
+        c -= c % FATTN_KQ_STRIDE;
+        return c < FATTN_KQ_STRIDE ? (int64_t) FATTN_KQ_STRIDE : c;
+    }();
+    return chunk;
+}
+
+// number of KV cells converted to F16 per chunk for an MMA launch, 0 = no chunking (whole KV at once)
+static int64_t ggml_cuda_fattn_kv_chunk(const ggml_tensor * dst) {
+    const int64_t chunk = ggml_cuda_fattn_kv_chunk_env();
+    if (chunk == 0) {
+        return 0;
+    }
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * sinks = dst->src[4];
+    if (sinks != nullptr) {
+        return 0; // the sink would be counted once per chunk
+    }
+    if (K->ne[0] > 256 || V->ne[0] > 256) {
+        return 0; // MLA / sparse variants: untouched
+    }
+    if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+        return 0; // nothing to convert
+    }
+    if (K->ne[1] <= chunk) {
+        return 0;
+    }
+    return chunk;
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
-        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V, const bool allow_kv_chunk = false) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = dst->src[1];
@@ -62,13 +107,18 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
+    // PATCH(fa-kv-chunk): with chunking only one chunk of K/V is converted at a time
+    const int64_t kv_chunk = allow_kv_chunk ? ggml_cuda_fattn_kv_chunk(dst) : 0;
+    const int64_t ne_K = kv_chunk > 0 ? K->ne[0]*kv_chunk*K->ne[2]*K->ne[3] : ggml_nelements(K);
+    const int64_t ne_V = kv_chunk > 0 ? V->ne[0]*kv_chunk*V->ne[2]*V->ne[3] : ggml_nelements(V);
+
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
         data.K   = data.end;
-        data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
+        data.end += ne_K*ggml_type_size(GGML_TYPE_F16);
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -77,7 +127,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
         } else {
             data.end = GGML_PAD(data.end, 128);
             data.V   = data.end;
-            data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
+            data.end += ne_V*ggml_type_size(GGML_TYPE_F16);
         }
     }
 
@@ -972,6 +1022,83 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// PATCH(fa-kv-chunk): merge n_parts normalized partial results (parts, meta_parts = per-row KQ max + rowsum; part p
+// at parts + p*nrows*DV) into the running result (dst, meta_acc); with init the running result starts empty.
+// A part whose rowsum is 0 (the row sees no cell of it, e.g. cells of another sequence or in the future)
+// contributes nothing; its (0/0) output is never read.
+template <int DV>
+static __global__ void flash_attn_kv_chunk_merge(
+        float * __restrict__ dst, float2 * __restrict__ meta_acc, const float * __restrict__ parts, const float2 * __restrict__ meta_parts,
+        const int n_parts, const int64_t nrows, const bool init) {
+    const int64_t row = blockIdx.x;
+
+    float2 ma = make_float2(-FLT_MAX/2.0f, 0.0f);
+    if (!init) {
+        ma = meta_acc[row];
+    }
+    bool  any = ma.y > 0.0f;
+    float m   = any ? ma.x : -FLT_MAX/2.0f;
+    for (int p = 0; p < n_parts; ++p) {
+        const float2 mp = meta_parts[p*nrows + row];
+        if (mp.y > 0.0f) {
+            m   = any ? fmaxf(m, mp.x) : mp.x;
+            any = true;
+        }
+    }
+
+    float * d = dst + row*DV;
+
+    if (!any) {
+        if (init) {
+            for (int i = threadIdx.x; i < DV; i += blockDim.x) {
+                d[i] = 0.0f;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                meta_acc[row] = make_float2(-FLT_MAX/2.0f, 0.0f);
+            }
+        }
+        return;
+    }
+
+    const float wa = ma.y > 0.0f ? ma.y*expf(ma.x - m) : 0.0f;
+    float wsum = wa;
+    for (int p = 0; p < n_parts; ++p) {
+        const float2 mp = meta_parts[p*nrows + row];
+        if (mp.y > 0.0f) {
+            wsum += mp.y*expf(mp.x - m);
+        }
+    }
+    const float inv = 1.0f/wsum;
+
+    for (int i = threadIdx.x; i < DV; i += blockDim.x) {
+        float acc = wa > 0.0f ? wa*d[i] : 0.0f;
+        for (int p = 0; p < n_parts; ++p) {
+            const float2 mp = meta_parts[p*nrows + row];
+            if (mp.y > 0.0f) {
+                acc += mp.y*expf(mp.x - m)*parts[(p*nrows + row)*DV + i];
+            }
+        }
+        d[i] = acc*inv;
+    }
+
+    __syncthreads(); // every thread has read meta_acc[row]
+    if (threadIdx.x == 0) {
+        meta_acc[row] = make_float2(m, wsum);
+    }
+}
+
+// PATCH(fa-kv-chunk): max. number of KV sub-ranges per chunk processed in parallel (GGML_CUDA_FA_KV_CHUNK_PAR,
+// default 32, 1 = one CUDA block per output tile only)
+static int ggml_cuda_fattn_kv_chunk_par_max() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_FA_KV_CHUNK_PAR");
+        const int v = e ? atoi(e) : 32;
+        return v >= 1 ? v : 1;
+    }();
+    return n;
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1006,8 +1133,139 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    // PATCH(fa-kv-chunk): only the MMA kernel (the only caller with stream_k) supports KV chunking
+    const int64_t kv_chunk = stream_k && !use_sparse ? ggml_cuda_fattn_kv_chunk(KQV) : 0;
+
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, stream_k && !use_sparse);
+
+    if (kv_chunk > 0) {
+        const int ntiles_x_c     = (Q->ne[1] + ncols1 - 1) / ncols1;
+        const int gqa_ratio_c    = Q->ne[2] / K->ne[2];
+        const int ntiles_z_gqa_c = (gqa_ratio_c + ncols2 - 1) / ncols2;
+        const int ntiles_dst_c   = ntiles_x_c * ntiles_z_gqa_c * K->ne[2] * Q->ne[3];
+
+        float scale_c         = 1.0f;
+        float max_bias_c      = 0.0f;
+        float logit_softcap_c = 0.0f;
+        memcpy(&scale_c,         (const float *) KQV->op_params + 0, sizeof(float));
+        memcpy(&max_bias_c,      (const float *) KQV->op_params + 1, sizeof(float));
+        memcpy(&logit_softcap_c, (const float *) KQV->op_params + 2, sizeof(float));
+        if (logit_softcap_c != 0.0f) {
+            scale_c /= logit_softcap_c;
+        }
+        const uint32_t n_head_c      = Q->ne[2];
+        const uint32_t n_head_log2_c = 1u << uint32_t(floorf(log2f(float(n_head_c))));
+        const float m0_c = powf(2.0f, -(max_bias_c       ) / n_head_log2_c);
+        const float m1_c = powf(2.0f, -(max_bias_c / 2.0f) / n_head_log2_c);
+        const uint3 ne01_c = init_fastdiv_values(Q->ne[1]);
+
+        GGML_ASSERT(KQV->ne[0] == DV);
+
+        const dim3 block_dim_c(warp_size, nwarps, 1);
+
+        // small batches have few output tiles: split each chunk into n_par KV sub-ranges so that the GPU is filled
+        int max_blocks_per_sm_c = 1;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm_c, fattn_kernel, block_dim_c.x * block_dim_c.y * block_dim_c.z, nbytes_shared));
+        const int max_blocks_c = std::max(1, max_blocks_per_sm_c) * nsm;
+        const int n_par_target = std::max(1, std::min(ggml_cuda_fattn_kv_chunk_par_max(), (max_blocks_c + ntiles_dst_c - 1) / ntiles_dst_c));
+
+        const int64_t nrows = ggml_nrows(KQV);
+        ggml_cuda_pool_alloc<float2> meta_acc  (pool, nrows);
+        ggml_cuda_pool_alloc<float2> meta_parts(pool, nrows*n_par_target);
+        ggml_cuda_pool_alloc<float>  parts     (pool, ggml_nelements(KQV)*n_par_target);
+
+        for (int64_t k0 = 0; k0 < K->ne[1]; k0 += kv_chunk) {
+            const int64_t n_c = std::min(kv_chunk, K->ne[1] - k0);
+
+            const char * K_c = (const char *) K->data + k0*K->nb[1];
+            size_t nb11_c = K->nb[1];
+            size_t nb12_c = K->nb[2];
+            size_t nb13_c = K->nb[3];
+            if (need_f16_K && K->type != GGML_TYPE_F16) {
+                const size_t ts = ggml_type_size(K->type);
+                GGML_ASSERT(K->nb[0] == ts);
+                GGML_ASSERT(f16_extra.K != 0);
+                half * K_f16 = (half *) f16_extra.K;
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+                GGML_ASSERT(to_fp16 != nullptr);
+                to_fp16(K_c, K_f16, K->ne[0], n_c, K->ne[2], K->ne[3], K->nb[1]/ts, K->nb[2]/ts, K->nb[3]/ts, main_stream);
+                nb11_c = K->ne[0]*sizeof(half);
+                nb12_c = n_c*nb11_c;
+                nb13_c = K->ne[2]*nb12_c;
+                K_c = (const char *) K_f16;
+            }
+
+            const char * V_c = (const char *) V->data + k0*V->nb[1];
+            size_t nb21_c = V->nb[1];
+            size_t nb22_c = V->nb[2];
+            size_t nb23_c = V->nb[3];
+            if (V_is_K_view) {
+                V_c    = K_c;
+                nb21_c = nb11_c;
+                nb22_c = nb12_c;
+                nb23_c = nb13_c;
+            } else if (need_f16_V && V->type != GGML_TYPE_F16) {
+                const size_t ts = ggml_type_size(V->type);
+                GGML_ASSERT(V->nb[0] == ts);
+                GGML_ASSERT(f16_extra.V != 0);
+                half * V_f16 = (half *) f16_extra.V;
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                GGML_ASSERT(to_fp16 != nullptr);
+                to_fp16(V_c, V_f16, V->ne[0], n_c, V->ne[2], V->ne[3], V->nb[1]/ts, V->nb[2]/ts, V->nb[3]/ts, main_stream);
+                nb21_c = V->ne[0]*sizeof(half);
+                nb22_c = n_c*nb21_c;
+                nb23_c = V->ne[2]*nb22_c;
+                V_c = (const char *) V_f16;
+            }
+
+            const char * mask_c = mask ? (const char *) mask->data + k0*mask->nb[0] : nullptr;
+
+            // equal sub-ranges, multiples of FATTN_KQ_STRIDE cells: the largest divisor of the chunk in strides <= n_par_target
+            int n_par = 1;
+            if (n_par_target > 1 && n_c % FATTN_KQ_STRIDE == 0) {
+                const int n_strides = int(n_c / FATTN_KQ_STRIDE);
+                for (int d = std::min(n_par_target, n_strides); d > 1; --d) {
+                    if (n_strides % d == 0) {
+                        n_par = d;
+                        break;
+                    }
+                }
+            }
+            const int64_t n_sub = n_c / n_par;
+
+            // a single part of the first chunk goes straight to dst, everything else is merged
+            const bool direct = k0 == 0 && n_par == 1;
+            float  * dst_c  = direct ? (float *) KQV->data : parts.ptr;
+            float2 * meta_c = direct ? meta_acc.ptr        : meta_parts.ptr;
+
+            const dim3 blocks_num_c(ntiles_dst_c, n_par, 1);
+            ggml_cuda_kernel_launch_params launch_params_c = ggml_cuda_kernel_launch_params(blocks_num_c, block_dim_c, nbytes_shared, main_stream);
+            ggml_cuda_kernel_launch(fattn_kernel, launch_params_c,
+                (const char *) Q->data,
+                K_c,
+                V_c,
+                mask_c,
+                (const char *) nullptr,
+                (const int *) nullptr,
+                dst_c, meta_c,
+                scale_c, max_bias_c, m0_c, m1_c, n_head_log2_c, logit_softcap_c,
+                Q->ne[0], ne01_c,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+                K->ne[0], n_sub, K->ne[2], K->ne[3], nb11_c, nb12_c, nb13_c,
+                nb21_c, nb22_c, nb23_c,
+                mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+                mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            if (!direct) {
+                flash_attn_kv_chunk_merge<DV><<<nrows, std::min(DV, 256), 0, main_stream>>>(
+                    (float *) KQV->data, meta_acc.ptr, parts.ptr, meta_parts.ptr, n_par, nrows, k0 == 0);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+        return;
+    }
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);

@@ -1782,6 +1782,15 @@ private:
             }
         }
 
+        // PATCH(busy-slot-cache): a request pinned to a busy slot (id_slot) keeps `ret` even though the
+        // similarity/LRU scans skip busy slots, so f_keep = 0 and update_cache = true: the cache update below
+        // would then save and load *another* prompt into the slot while its task is still running (the KV and
+        // prompt.tokens of the running task are replaced, the task spins forever in PROCESSING_PROMPT or
+        // generates from a foreign KV). The caller defers the request when the slot is busy - touch nothing.
+        if (ret && ret->is_processing()) {
+            return ret;
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
