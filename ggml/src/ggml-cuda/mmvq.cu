@@ -5,6 +5,44 @@
 #ifndef MMVQ_Q3K_NW1
 #define MMVQ_Q3K_NW1 2   // production value (built with -DMMVQ_Q3K_NW1=2)
 #endif
+// PATCH(mmvq-c5): 5-column table measured on the 5070 (gemv-bench5, 300 MB/case): q4_K 510->539, q5_K 540->569,
+// q6_K 545->562, iq4_xs 573->588 GB/s. Types not listed keep the generic 2 warps x 2 rows.
+#ifndef MMVQ_C58_NW_Q3_K
+#define MMVQ_C58_NW_Q3_K 2
+#endif
+#ifndef MMVQ_C58_NW_IQ3_S
+#define MMVQ_C58_NW_IQ3_S 2
+#endif
+#ifndef MMVQ_C58_NW_Q4_K
+#define MMVQ_C58_NW_Q4_K 2
+#endif
+#ifndef MMVQ_C58_NW_Q5_K
+#define MMVQ_C58_NW_Q5_K 1
+#endif
+#ifndef MMVQ_C58_NW_Q6_K
+#define MMVQ_C58_NW_Q6_K 2
+#endif
+#ifndef MMVQ_C58_NW_IQ4_XS
+#define MMVQ_C58_NW_IQ4_XS 1
+#endif
+#ifndef MMVQ_C58_RPB_Q3_K
+#define MMVQ_C58_RPB_Q3_K 2
+#endif
+#ifndef MMVQ_C58_RPB_IQ3_S
+#define MMVQ_C58_RPB_IQ3_S 2
+#endif
+#ifndef MMVQ_C58_RPB_Q4_K
+#define MMVQ_C58_RPB_Q4_K 4
+#endif
+#ifndef MMVQ_C58_RPB_Q5_K
+#define MMVQ_C58_RPB_Q5_K 2
+#endif
+#ifndef MMVQ_C58_RPB_Q6_K
+#define MMVQ_C58_RPB_Q6_K 4
+#endif
+#ifndef MMVQ_C58_RPB_IQ4_XS
+#define MMVQ_C58_RPB_IQ4_XS 2
+#endif
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -464,6 +502,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         if (ncols_dst == 1 && type == GGML_TYPE_Q3_K) {
             return MMVQ_Q3K_NW1;
         }
+        // PATCH(mmvq-c5): 5..8 columns (MTP n-max 4 verifies 5 tokens). MMVQ_C58_NW overrides all types (sweeps).
+#ifdef MMVQ_C58_NW
+        if (ncols_dst >= 5 && ncols_dst <= 8) {
+            return MMVQ_C58_NW;
+        }
+#else
+        if (ncols_dst >= 5 && ncols_dst <= 8) {
+            switch (type) {
+                case GGML_TYPE_Q3_K:   return MMVQ_C58_NW_Q3_K;
+                case GGML_TYPE_IQ3_S:  return MMVQ_C58_NW_IQ3_S;
+                case GGML_TYPE_Q4_K:   return MMVQ_C58_NW_Q4_K;
+                case GGML_TYPE_Q5_K:   return MMVQ_C58_NW_Q5_K;
+                case GGML_TYPE_Q6_K:   return MMVQ_C58_NW_Q6_K;
+                case GGML_TYPE_IQ4_XS: return MMVQ_C58_NW_IQ4_XS;
+                default:               break;
+            }
+        }
+#endif
         if (ncols_dst >= 2 && ncols_dst <= 4) {
             switch (type) {
                 case GGML_TYPE_Q3_K:   return 1;
@@ -621,6 +677,23 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block_t(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+#ifdef MMVQ_C58_RPB
+    if (table_id == MMVQ_PARAMETERS_GENERIC && ncols_dst >= 5 && ncols_dst <= 8) {
+        return MMVQ_C58_RPB;
+    }
+#else
+    if (table_id == MMVQ_PARAMETERS_GENERIC && ncols_dst >= 5 && ncols_dst <= 8) {
+        switch (type) {
+            case GGML_TYPE_Q3_K:   return MMVQ_C58_RPB_Q3_K;
+            case GGML_TYPE_IQ3_S:  return MMVQ_C58_RPB_IQ3_S;
+            case GGML_TYPE_Q4_K:   return MMVQ_C58_RPB_Q4_K;
+            case GGML_TYPE_Q5_K:   return MMVQ_C58_RPB_Q5_K;
+            case GGML_TYPE_Q6_K:   return MMVQ_C58_RPB_Q6_K;
+            case GGML_TYPE_IQ4_XS: return MMVQ_C58_RPB_IQ4_XS;
+            default:               break;
+        }
+    }
+#endif
     if (table_id == MMVQ_PARAMETERS_GENERIC && ncols_dst >= 2 && ncols_dst <= 4) {
         switch (type) {
             case GGML_TYPE_Q3_K:
