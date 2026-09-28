@@ -1,4 +1,3 @@
-#include <fstream>
 #include "speculative.h"
 
 #include "common.h"
@@ -1328,51 +1327,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// PATCH(mtp-draft-extra): the truncated draft head (LLAMA_MTP_DRAFT_VOCAB=K) may carry, after its first
-// K0 = K - n rows, n extra rows for frequent high token ids (e.g. Portuguese words above id 131072 that a
-// plain first-K head can never draft). LLAMA_MTP_DRAFT_EXTRA_IDS=<file> lists those ids in row order; the
-// logits of rows K0.. are moved to their real ids before sampling. Unset => no-op.
-static const std::vector<llama_token> & mtp_draft_extra_ids() {
-    static const std::vector<llama_token> ids = [] {
-        std::vector<llama_token> v;
-        const char * p = std::getenv("LLAMA_MTP_DRAFT_EXTRA_IDS");
-        if (p != nullptr) {
-            std::ifstream f(p);
-            long long x;
-            while (f >> x) {
-                v.push_back((llama_token) x);
-            }
-        }
-        return v;
-    }();
-    return ids;
-}
-
-static void mtp_draft_remap_logits(llama_context * ctx, int32_t idx) {
-    const auto & ids = mtp_draft_extra_ids();
-    if (ids.empty()) {
-        return;
-    }
-    static const int64_t k = [] {
-        const char * e = std::getenv("LLAMA_MTP_DRAFT_VOCAB");
-        return e ? (int64_t) std::atoll(e) : (int64_t) 0;
-    }();
-    const int64_t k0      = k - (int64_t) ids.size();
-    const int64_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-    float * logits = llama_get_logits_ith(ctx, idx);
-    if (k0 <= 0 || logits == nullptr) {
-        return;
-    }
-    for (size_t j = 0; j < ids.size(); ++j) {
-        const int64_t id = ids[j];
-        if (id < k || id >= n_vocab) {
-            continue; // must point outside the head rows
-        }
-        logits[id]     = logits[k0 + j];
-        logits[k0 + j] = 0.0f;
-    }
-}
-
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1740,7 +1694,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                mtp_draft_remap_logits(ctx_dft, i_last[seq_id]); // PATCH(mtp-draft-extra)
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
