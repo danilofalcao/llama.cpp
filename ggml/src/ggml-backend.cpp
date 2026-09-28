@@ -1887,7 +1887,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
+    // PATCH(sched-copies): GGML_SCHED_N_COPIES=N (1..GGML_SCHED_MAX_COPIES) sets the pipeline depth at runtime.
+    // Every copy duplicates the split inputs (at long context the KQ mask alone is n_ubatch*n_kv*2 bytes per
+    // device and copy); two devices only need two copies to overlap.
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    if (parallel) {
+        const char * e = getenv("GGML_SCHED_N_COPIES");
+        if (e != nullptr) {
+            const int n = atoi(e);
+            if (n >= 1 && n <= GGML_SCHED_MAX_COPIES) {
+                sched->n_copies = n;
+            }
+        }
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

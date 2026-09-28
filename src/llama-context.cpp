@@ -3352,8 +3352,28 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
-        const size_t nread = state_seq_read_data(io, seq_id, 0);
+        // PATCH(state-ref-file): fail a file restore exactly like state_seq_set_data does when a KV region
+        // held by reference on the RPC server is missing or was saved in a different layout; otherwise the
+        // sequence keeps a partially restored KV and the model answers from it
+        static const auto take_misses = []() -> int (*)(void) {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            return reg ? (int (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_state_ref_take_misses") : nullptr;
+        }();
+        if (take_misses) {
+            take_misses();
+        }
+        size_t nread = 0;
+        {
+            llama_io_read_file io(&file);
+            nread = state_seq_read_data(io, seq_id, 0);
+        } // io destroyed: any deferred tensor writes (and their misses) happen before the check below
+        if (take_misses && take_misses() > 0) {
+            LLAMA_LOG_ERROR("%s: state of seq %d references data the RPC server no longer has, or was saved in a different layout - clearing it\n", __func__, seq_id);
+            if (memory) {
+                memory->seq_rm(seq_id, -1, -1);
+            }
+            return 0;
+        }
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;

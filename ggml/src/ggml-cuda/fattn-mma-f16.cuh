@@ -1641,6 +1641,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 if (np*cols_per_warp >= warp_size || threadIdx.x < np*cols_per_warp) {
                     // Combined KQ max scale + rowsum.
                     meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
+                    // PATCH(fa-kv-chunk): the combined KQ max goes into the second (otherwise unused) float2 of
+                    // the row padding so that a KV-chunked launch can export (max, rowsum) per output row.
+                    meta_ptr[imeta * warp_size * tile_stride/2 + 1] = make_float2(KQ_cmn, 0.0f);
                 }
             }
 
@@ -1659,6 +1662,28 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 #pragma unroll
     for (int k00 = 0; k00 < DV/2; k00 += nbatch_combine) {
+        // PATCH(fa-kv-chunk): with a KV-chunked launch (see launch_fattn) a CUDA block always works on an entire
+        // tile and dstk_fixup points to a per-row (KQ max, KQ rowsum) output instead of the stream-k fixup buffer.
+        // The meta data in the row padding of tile_Q is final at this point (written before the __syncthreads
+        // at the end of the previous section / the combine section above).
+        if (!needs_fixup && !is_fixup && dstk_fixup != nullptr && k00 == 0) {
+            if (np > 1) {
+                __syncthreads();
+            }
+            if (np == 1 || threadIdx.y % np == 0) {
+                for (int jc_dst = (threadIdx.y/np)*warp_size + threadIdx.x; jc_dst < ncols; jc_dst += (nwarps/np)*warp_size) {
+                    const int jc_tile_K = (jc_dst/cols_per_warp)*(np*cols_per_warp) + jc_dst % cols_per_warp;
+                    const int j_dst = jc_dst / ncols2;
+                    const int c_dst = jc_dst % ncols2;
+                    if ((ncols1 > 1 && jt*ncols1 + j_dst >= int(ne01.z)) || (ncols2 > 1 && zt_gqa*ncols2 + c_dst >= gqa_ratio)) {
+                        continue;
+                    }
+                    const float * meta_j = (const float *) tile_Q + jc_tile_K*tile_stride + nbatch_combine;
+                    dstk_fixup[(jt*ncols1 + j_dst)*ne02 + c_dst] = make_float2(np == 1 ? meta_j[0] : meta_j[2], meta_j[1]);
+                }
+            }
+        }
+
         if constexpr (cols_per_warp == 8) {
             static_assert(std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>, "bad VKQ type");
             const int jc_cwd = threadIdx.y*T_B_KQ::I + T_B_KQ::get_i(-1); // jc combine write data
@@ -1916,6 +1941,27 @@ static __global__ void flash_attn_ext_f16(
     int kb0_start = kbc % iter_k;
     int kb0_stop  = min(iter_k, kb0_start + kbc_stop - kbc);
 
+    // PATCH(fa-kv-chunk): one CUDA block per output tile (no stream-k) together with a non-null dst_meta means the
+    // launch is one KV chunk of a chunked FA: every block works on an entire tile and exports (KQ max, KQ rowsum)
+    // per output row to dst_meta so that the chunks can be merged. In any other launch dst_meta is either null
+    // or the stream-k fixup buffer, which is only allocated if gridDim.x != number of tiles.
+    const bool export_meta = dst_meta != nullptr && int(gridDim.x) == iter_j*iter_z_gqa*ne12*ne03;
+
+    // PATCH(fa-kv-chunk): a chunked launch may also split the chunk into gridDim.y equal KV sub-ranges of ne11 cells
+    // (small batches have too few output tiles to fill the GPU). Sub-range y reads cells [y*ne11, (y+1)*ne11) and
+    // writes its own partial result + meta, merged by the launcher.
+    if (export_meta && gridDim.y > 1) {
+        K    += int64_t(blockIdx.y)*ne11*nb11;
+        if (!V_is_K_view) {
+            V += int64_t(blockIdx.y)*ne11*nb21;
+        }
+        if (mask) {
+            mask += int64_t(blockIdx.y)*ne11*sizeof(half);
+        }
+        dst      += int64_t(blockIdx.y)*ne01.z*ne02*ne03*DV;
+        dst_meta += int64_t(blockIdx.y)*ne01.z*ne02*ne03;
+    }
+
     while (kbc < kbc_stop && kb0_stop == iter_k) {
         // z_KV == K/V head index, zt_gqa = Q head start index per K/V head, jt = token position start index
         const int sequence =  kbc /(iter_k*iter_j*iter_z_gqa*ne12);
@@ -1945,8 +1991,9 @@ static __global__ void flash_attn_ext_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
+            float2 * meta_k = export_meta ? dst_meta + (sequence*ne01.z*ne02 + zt_Q) : nullptr;
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
-                (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, meta_k, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.

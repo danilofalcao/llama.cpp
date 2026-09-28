@@ -648,7 +648,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
+                    // PATCH(fa-vec-batch): GGML_CUDA_FA_VEC_MAX_BATCH=N routes batches of up to N queries over a
+                    // quantized KV cache to the vector kernel, which reads the quantized K/V directly. The MMA kernel
+                    // first converts the whole K/V view to F16, which dominates small batches (e.g. speculative
+                    // verification) at long context. Default 2 (upstream).
+                    static const int vec_max_batch = [] {
+                        const char * e = getenv("GGML_CUDA_FA_VEC_MAX_BATCH");
+                        const int n = e ? atoi(e) : 2;
+                        return n > 0 ? n : 2;
+                    }();
+                    if (Q->ne[1] <= vec_max_batch) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {
@@ -746,8 +755,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    // PATCH(fa-kv-chunk): the MMA launcher converts K/V chunk by chunk, reserve one chunk only
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, kernel == BEST_FATTN_KERNEL_MMA_F16);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }

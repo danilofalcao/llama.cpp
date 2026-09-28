@@ -2524,6 +2524,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
+
+    // PATCH(draft-ubatch): LLAMA_SPEC_DRAFT_UBATCH=N gives the draft context a smaller ubatch than the target.
+    // The draft batch (up to n_batch) is split into ubatches by llama_decode as usual; a small draft (e.g. a
+    // single MTP block) gains little from wide ubatches, while its worst-case compute buffer scales with
+    // n_ubatch - at long context mostly the KQ mask, n_ubatch * n_ctx * 2 bytes (128 MiB at 256 x 256K).
+    if (const char * e = getenv("LLAMA_SPEC_DRAFT_UBATCH")) {
+        const int32_t n = atoi(e);
+        if (n > 0 && n < result.n_ubatch) {
+            result.n_ubatch = n;
+        }
+    }
     result.n_outputs_max_per_seq = 1;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
