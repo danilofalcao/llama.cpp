@@ -1707,6 +1707,32 @@ private:
     std::unordered_map<uint64_t, state_entry> state_cache;
     std::list<uint64_t> state_cache_order;
     size_t state_cache_bytes  = 0;
+
+    // PATCH(state-dedup): KV regions saved by reference (prompt cache / slot-swap) are stored as
+    // content-addressed chunks aligned to absolute tensor offsets, plus a manifest per region. A
+    // conversation that grew by one turn is saved again as a region that shares every full chunk
+    // with the previous version, so only the new tokens take memory. LRU over manifests; a chunk is
+    // freed when no manifest references it. GGML_RPC_KV_DEDUP_MB (0 = off, old whole-region path).
+    struct kv_chunk    { std::vector<uint8_t> data; uint32_t refs = 0; };
+    struct kv_manifest { std::vector<uint64_t> chunks; uint64_t size = 0; std::list<uint64_t>::iterator lru; };
+    std::unordered_map<uint64_t, kv_chunk>    kv_chunks;
+    std::unordered_map<uint64_t, kv_manifest> kv_manifests;
+    std::list<uint64_t> kv_order;
+    size_t   kv_bytes   = 0;
+    uint64_t kv_logical = 0;
+    uint64_t kv_puts    = 0;
+    size_t   kv_budget  = [] {
+        const char * e = std::getenv("GGML_RPC_KV_DEDUP_MB");
+        return e != nullptr ? (size_t) std::atoll(e) * 1024 * 1024 : (size_t) 0;
+    }();
+    size_t   kv_chunk_size = [] {
+        const char * e = std::getenv("GGML_RPC_KV_CHUNK_KB");
+        const size_t kb = e != nullptr ? (size_t) std::atoll(e) : 256;
+        return (kb > 0 ? kb : 256) * 1024;
+    }();
+    uint64_t kv_put(size_t offset, const std::vector<uint8_t> & data);
+    bool     kv_read(uint64_t hash, uint64_t src_off, uint64_t len, uint8_t * dst);
+    void     kv_drop(uint64_t hash);
     size_t state_cache_budget = [] {
         const char * e = std::getenv("GGML_RPC_STATE_CACHE_MB");
         return e != nullptr ? (size_t) std::atoll(e) * 1024 * 1024 : (size_t) 0;
@@ -2208,18 +2234,30 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 {
     std::vector<uint8_t> cached_file;
     const uint8_t * src_data = nullptr;
+    size_t size = 0;
+    // PATCH(state-dedup): chunked KV regions first
+    auto km = kv_manifests.find(request.hash);
     // PATCH(rpc-state-cache): recently read recurrent-state regions first
     auto sc = state_cache.find(request.hash);
-    if (sc != state_cache.end()) {
+    if (km != kv_manifests.end()) {
+        cached_file.resize(km->second.size);
+        if (!kv_read(request.hash, 0, cached_file.size(), cached_file.data())) {
+            response.result = 0;
+            return true;
+        }
+        src_data = cached_file.data();
+        size     = cached_file.size();
+    } else if (sc != state_cache.end()) {
         state_cache_order.splice(state_cache_order.end(), state_cache_order, sc->second.lru); // PATCH(rpc-state-ref)
         src_data = sc->second.data.data();
+        size     = sc->second.data.size();
     } else if (get_cached_file(request.hash, cached_file)) {
         src_data = cached_file.data();
+        size     = cached_file.size();
     } else {
         response.result = 0;
         return true;
     }
-    size_t size = sc != state_cache.end() ? sc->second.data.size() : cached_file.size();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -2261,8 +2299,21 @@ bool rpc_server::set_tensor_hash_range(const rpc_msg_set_tensor_hash_range_req &
     std::vector<uint8_t> cached_file;
     const uint8_t * src_data = nullptr;
     size_t src_size = 0;
+    size_t src_base = 0;
     auto sc = state_cache.find(request.hash);
-    if (sc != state_cache.end()) {
+    auto km = kv_manifests.find(request.hash); // PATCH(state-dedup)
+    if (km != kv_manifests.end()) {
+        if (request.src_offset > km->second.size || request.size > km->second.size - request.src_offset) {
+            return true;
+        }
+        cached_file.resize(request.size);
+        if (!kv_read(request.hash, request.src_offset, request.size, cached_file.data())) {
+            return true;
+        }
+        src_data = cached_file.data();
+        src_size = km->second.size;
+        src_base = request.src_offset; // cached_file holds only the requested range
+    } else if (sc != state_cache.end()) {
         state_cache_order.splice(state_cache_order.end(), state_cache_order, sc->second.lru);
         src_data = sc->second.data.data();
         src_size = sc->second.data.size();
@@ -2298,7 +2349,7 @@ bool rpc_server::set_tensor_hash_range(const rpc_msg_set_tensor_hash_range_req &
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, src_data + request.src_offset, request.offset, request.size);
+    ggml_backend_tensor_set(tensor, src_data + (request.src_offset - src_base), request.offset, request.size);
     response.result = 1;
     return true;
 }
@@ -2378,11 +2429,98 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     return true;
 }
 
+// PATCH(state-dedup)
+void rpc_server::kv_drop(uint64_t hash) {
+    auto it = kv_manifests.find(hash);
+    if (it == kv_manifests.end()) {
+        return;
+    }
+    for (uint64_t ch : it->second.chunks) {
+        auto c = kv_chunks.find(ch);
+        if (c != kv_chunks.end() && --c->second.refs == 0) {
+            kv_bytes -= c->second.data.size();
+            kv_chunks.erase(c);
+        }
+    }
+    kv_logical -= it->second.size;
+    kv_order.erase(it->second.lru);
+    kv_manifests.erase(it);
+}
+
+uint64_t rpc_server::kv_put(size_t offset, const std::vector<uint8_t> & data) {
+    const size_t C = kv_chunk_size;
+    std::vector<uint64_t> ch;
+    ch.reserve(data.size() / C + 2);
+    for (size_t pos = 0; pos < data.size(); ) {
+        const size_t abs = offset + pos;
+        const size_t n   = std::min(data.size() - pos, (abs / C + 1) * C - abs);
+        ch.push_back(rpc_state_hash(data.data() + pos, n));
+        pos += n;
+    }
+    const uint64_t hash = rpc_state_hash((const uint8_t *) ch.data(), ch.size() * sizeof(uint64_t)) ^ 0x6b762d6465647570ULL;
+    auto hit = kv_manifests.find(hash);
+    if (hit != kv_manifests.end()) {
+        kv_order.splice(kv_order.end(), kv_order, hit->second.lru);
+        return hash;
+    }
+    size_t pos = 0;
+    for (uint64_t h : ch) {
+        const size_t abs = offset + pos;
+        const size_t n   = std::min(data.size() - pos, (abs / C + 1) * C - abs);
+        auto & c = kv_chunks[h];
+        if (c.refs == 0 && c.data.empty()) {
+            c.data.assign(data.begin() + pos, data.begin() + pos + n);
+            kv_bytes += n;
+        }
+        c.refs++;
+        pos += n;
+    }
+    kv_order.push_back(hash);
+    kv_manifests.emplace(hash, kv_manifest{ std::move(ch), (uint64_t) data.size(), std::prev(kv_order.end()) });
+    kv_logical += data.size();
+    while (kv_bytes > kv_budget && kv_order.size() > 1) {
+        kv_drop(kv_order.front());
+    }
+    if (++kv_puts % 256 == 0) {
+        GGML_LOG_INFO("[kv-dedup] %zu regions, %.0f MiB logical, %.0f MiB stored in %zu chunks (budget %.0f MiB)\n",
+                      kv_manifests.size(), kv_logical / 1048576.0, kv_bytes / 1048576.0, kv_chunks.size(), kv_budget / 1048576.0);
+    }
+    return hash;
+}
+
+bool rpc_server::kv_read(uint64_t hash, uint64_t src_off, uint64_t len, uint8_t * dst) {
+    auto it = kv_manifests.find(hash);
+    if (it == kv_manifests.end() || src_off > it->second.size || len > it->second.size - src_off) {
+        return false;
+    }
+    kv_order.splice(kv_order.end(), kv_order, it->second.lru);
+    uint64_t pos = 0;
+    for (uint64_t h : it->second.chunks) {
+        auto c = kv_chunks.find(h);
+        if (c == kv_chunks.end()) {
+            return false;
+        }
+        const uint64_t n  = c->second.data.size();
+        const uint64_t a  = std::max(pos, src_off);
+        const uint64_t b  = std::min(pos + n, src_off + len);
+        if (a < b) {
+            memcpy(dst + (a - src_off), c->second.data.data() + (a - pos), b - a);
+        }
+        pos += n;
+        if (pos >= src_off + len) {
+            break;
+        }
+    }
+    return true;
+}
+
 // PATCH(rpc-state-ref): read a KV region into the state cache and return only its hash
 bool rpc_server::get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response) {
     response.hash   = 0;
     response.result = 0;
-    if (state_cache_budget == 0 || request.size < RPC_STATE_MIN_SIZE || request.size > state_cache_budget) {
+    const bool kv_region = kv_budget > 0 && request.size <= kv_budget &&
+        (strncmp(request.tensor.name, "cache_k_l", 9) == 0 || strncmp(request.tensor.name, "cache_v_l", 9) == 0); // PATCH(state-dedup)
+    if (!kv_region && (state_cache_budget == 0 || request.size < RPC_STATE_MIN_SIZE || request.size > state_cache_budget)) {
         return true;
     }
     struct ggml_init_params params {
@@ -2408,6 +2546,11 @@ bool rpc_server::get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_
     }
     std::vector<uint8_t> data(request.size);
     ggml_backend_tensor_get(tensor, data.data(), request.offset, request.size);
+    if (kv_region) { // PATCH(state-dedup)
+        response.hash   = kv_put(request.offset, data);
+        response.result = 1;
+        return true;
+    }
     const uint64_t hash = rpc_state_hash(data.data(), data.size());
     state_disk_put(hash, data); // PATCH(state-disk)
     if (state_cache_put(hash, std::move(data))) {
