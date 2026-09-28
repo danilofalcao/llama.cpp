@@ -1,3 +1,10 @@
+#include <mutex>
+#include <unordered_map>
+#include <cstring>
+#include <cstdlib>
+#ifndef MMVQ_Q3K_NW1
+#define MMVQ_Q3K_NW1 2   // production value (built with -DMMVQ_Q3K_NW1=2)
+#endif
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -451,6 +458,23 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        // Per-type tuning for Ada (sm_89) / Blackwell (sm_120) consumer cards, measured with a
+        // DRAM-bound GEMV bench (weights >> L2). Speculative decoding verifies 1 + n_draft tokens,
+        // so ncols_dst 2..4 is the hot case; the complex K-quants are compute-bound there.
+        if (ncols_dst == 1 && type == GGML_TYPE_Q3_K) {
+            return MMVQ_Q3K_NW1;
+        }
+        if (ncols_dst >= 2 && ncols_dst <= 4) {
+            switch (type) {
+                case GGML_TYPE_Q3_K:   return 1;
+                case GGML_TYPE_IQ3_S:  return 1;
+                case GGML_TYPE_Q4_K:   return 2;
+                case GGML_TYPE_Q5_K:   return 1;
+                case GGML_TYPE_Q6_K:   return 4;
+                case GGML_TYPE_IQ4_XS: return 2;
+                default:               break;
+            }
+        }
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -596,6 +620,24 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
+static constexpr __host__ __device__ int calc_rows_per_block_t(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC && ncols_dst >= 2 && ncols_dst <= 4) {
+        switch (type) {
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q6_K:
+                return 4;
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_IQ4_XS:
+                return 2;
+            default:
+                break;
+        }
+    }
+    return calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -615,7 +657,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block_t(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1000,7 +1042,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block_t(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1418,6 +1460,52 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// PATCH(mmvq-q8-reuse) -------------------------------------------------------------------------------
+namespace {
+struct mmvq_q8_cache {
+    void *       buf    = nullptr;
+    bool         valid  = false;
+    const char * src_lo = nullptr;
+    const char * src_hi = nullptr;
+    int64_t      key[8] = {0};
+    cudaStream_t stream = nullptr;
+};
+std::mutex g_mmvq_q8_mutex;
+std::unordered_map<const ggml_backend_cuda_context *, mmvq_q8_cache> g_mmvq_q8; // element refs are stable
+constexpr size_t MMVQ_Q8_BUF_SIZE = 4u << 20;
+
+mmvq_q8_cache & mmvq_q8_get(const ggml_backend_cuda_context & ctx) {
+    std::lock_guard<std::mutex> lock(g_mmvq_q8_mutex);
+    return g_mmvq_q8[&ctx];
+}
+
+bool mmvq_q8_enabled() {
+    static const bool e = [] {
+        const char * v = getenv("GGML_CUDA_MMVQ_Q8_REUSE");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return e;
+}
+} // namespace
+
+void ggml_cuda_mmvq_q8_cache_reset(ggml_backend_cuda_context & ctx) {
+    mmvq_q8_get(ctx).valid = false;
+}
+
+// any node whose output bytes overlap the cached src1 invalidates the cache
+void ggml_cuda_mmvq_q8_cache_on_write(ggml_backend_cuda_context & ctx, const ggml_tensor * node) {
+    auto & c = mmvq_q8_get(ctx);
+    if (!c.valid || node == nullptr || node->data == nullptr) {
+        return;
+    }
+    const char * lo = (const char *) node->data;
+    const char * hi = lo + ggml_nbytes(node);
+    if (lo < c.src_hi && c.src_lo < hi) {
+        c.valid = false;
+    }
+}
+// -----------------------------------------------------------------------------------------------------
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1498,12 +1586,45 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t  q8_size     = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const char * src1_q8_ptr = nullptr;
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+
+        // PATCH(mmvq-q8-reuse)
+        auto & c = mmvq_q8_get(ctx);
+        const int64_t key[8] = { ne10, ne11, ne12, ne13, s11, s12, s13, ne10_padded };
+        bool can_cache = mmvq_q8_enabled() && q8_size <= MMVQ_Q8_BUF_SIZE;
+        if (can_cache && c.buf == nullptr) {
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &cs));
+            if (cs == cudaStreamCaptureStatusNone) {
+                if (cudaMalloc(&c.buf, MMVQ_Q8_BUF_SIZE) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    c.buf = nullptr;
+                }
+            }
+        }
+        can_cache = can_cache && c.buf != nullptr;
+
+        if (can_cache && c.valid && c.stream == stream && c.src_lo == (const char *) src1->data &&
+                memcmp(c.key, key, sizeof(key)) == 0) {
+            src1_q8_ptr = (const char *) c.buf; // same bytes as re-quantizing
+        } else if (can_cache) {
+            quantize_row_q8_1_cuda(src1_d, nullptr, c.buf, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            c.valid  = true;
+            c.stream = stream;
+            c.src_lo = (const char *) src1->data;
+            c.src_hi = c.src_lo + ggml_nbytes(src1);
+            memcpy(c.key, key, sizeof(key));
+            src1_q8_ptr = (const char *) c.buf;
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.alloc(q8_size), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_ptr = src1_q8_1.get();
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1529,7 +1650,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

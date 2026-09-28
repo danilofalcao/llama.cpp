@@ -75,6 +75,18 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+    // PATCH(trunk-skip-mtp): common sets load_mtp for the TARGET whenever --spec-type draft-mtp is used,
+    // even when the draft comes from a separate --model-draft GGUF. The target then loads its built-in
+    // MTP block (blk.<n_layer>, ~351 MB for Qwen3.8-27B) that it never executes. With
+    // LLAMA_TRUNK_SKIP_MTP=1 a model that has a trunk skips that block; an MTP-only draft GGUF has no
+    // trunk and is unaffected. Do NOT set it when relying on the built-in MTP (no --model-draft).
+    if (!mtp_only && mtp_flags == 0) {
+        const char * e = std::getenv("LLAMA_TRUNK_SKIP_MTP");
+        if (e != nullptr && std::atoi(e) != 0) {
+            mtp_flags = TENSOR_SKIP;
+            LLAMA_LOG_INFO("%s: LLAMA_TRUNK_SKIP_MTP=1: not loading the built-in MTP block of the target\n", __func__);
+        }
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
