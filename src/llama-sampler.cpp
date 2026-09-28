@@ -2954,6 +2954,36 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
+    // Fast path: when the candidate array is the full vocab in token-id order (the normal case, right
+    // after the logits are copied in), every penalized token sits at index == id. Walk the
+    // <= penalty_last_n penalized tokens instead of hashing every one of the ~n_vocab candidates.
+    // Same operations on the same entries -> bit-identical result. Otherwise fall back below.
+    {
+        bool direct = true;
+        for (const auto & it : ctx->token_count) {
+            const llama_token tok = it.first;
+            if (tok < 0 || (size_t) tok >= cur_p->size || cur_p->data[tok].id != tok) {
+                direct = false;
+                break;
+            }
+        }
+        if (direct) {
+            for (const auto & it : ctx->token_count) {
+                llama_token_data & td = cur_p->data[it.first];
+                const int count = it.second;
+                assert(count > 0 && count <= ctx->penalty_last_n);
+                if (td.logit <= 0) {
+                    td.logit *= ctx->penalty_repeat;
+                } else {
+                    td.logit /= ctx->penalty_repeat;
+                }
+                td.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+            }
+            cur_p->sorted = false;
+            return;
+        }
+    }
+
     // Apply frequency and presence penalties to the cur_p
     for (size_t i = 0; i < cur_p->size; ++i) {
         const auto token_iter = ctx->token_count.find(cur_p->data[i].id);

@@ -139,6 +139,48 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// PATCH(concat-small-ne0): the generic non-contiguous kernel launches one block per (i1,i2,i3) row and
+// loops over i0 with blockDim.x threads. For the delta-net conv state (ne0 = d_conv-1 + n_tokens, e.g. 7,
+// with ~10240 rows) that is 10240 blocks with 7 active threads each: ~14 us for ~290 KB. Flat indexing,
+// one thread per element. Pure copy with the same index math -> bit-identical.
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_flat(
+        const char * src0, const char * src1, char * dst,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= ne0*ne1*ne2*ne3) {
+        return;
+    }
+    const int64_t i0 = idx % ne0;
+    int64_t       r  = idx / ne0;
+    const int64_t i1 = r % ne1; r /= ne1;
+    const int64_t i2 = r % ne2;
+    const int64_t i3 = r / ne2;
+
+    const T * x;
+    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+        x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+    } else {
+        if constexpr (dim == 0) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+        } else if constexpr (dim == 1) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+        } else if constexpr (dim == 2) {
+            x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+        } else {
+            x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+        }
+    }
+    T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+    *y = *x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +204,28 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        if (dst->ne[0] < CUDA_CONCAT_BLOCK_SIZE/4) {
+            const int64_t n    = ggml_nelements(dst);
+            const int64_t nblk = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+            auto launch_flat = [&](auto dim) {
+                concat_non_cont_flat<T, dim><<<nblk, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                    (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                    src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                    src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                    src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                    dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                    dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+            };
+            switch (dim) {
+                case 0: launch_flat(std::integral_constant<int, 0>{}); break;
+                case 1: launch_flat(std::integral_constant<int, 1>{}); break;
+                case 2: launch_flat(std::integral_constant<int, 2>{}); break;
+                case 3: launch_flat(std::integral_constant<int, 3>{}); break;
+                default: GGML_ABORT("Invalid dim: %d", dim);
+            }
+            return;
+        }
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

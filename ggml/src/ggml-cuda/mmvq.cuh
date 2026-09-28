@@ -16,3 +16,9 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// PATCH(mmvq-q8-reuse): consecutive MMVQ calls that read the same src1 (e.g. the 4 projections of a
+// delta-net layer, q/k/v, ffn gate/up) reuse the q8_1 quantization of src1 instead of recomputing it.
+// Quantization is deterministic, so the result is bit-identical. Disable with GGML_CUDA_MMVQ_Q8_REUSE=0.
+void ggml_cuda_mmvq_q8_cache_reset(ggml_backend_cuda_context & ctx);
+void ggml_cuda_mmvq_q8_cache_on_write(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
