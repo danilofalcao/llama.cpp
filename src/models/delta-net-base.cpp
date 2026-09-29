@@ -11,6 +11,14 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t 
         t->nb[1], t->nb[2], t->nb[3], t->nb[2] * c);
 }
 
+#include <cstdlib>
+
+// [rs-long-ckpt] LLAMA_RS_LONG_CKPT=1: see src/llama-memory-recurrent.h
+static bool rs_long_ckpt_enabled() {
+    static const bool v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT"); return e && atoi(e) != 0; }();
+    return v;
+}
+
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
@@ -501,8 +509,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
+        // [rs-long-ckpt] a pass longer than K keeps the pre-pass conv state in slot K-1 (s_idx 0 = the old state)
+        const int64_t T_conv    = conv_input->ne[0] - conv_states->ne[0];
+        const bool    long_ckpt = rs_long_ckpt_enabled() && T_conv > K;
+
         for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+            const int64_t s_idx  = (long_ckpt && t == 1) ? 0 : std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
             ggml_tensor * conv_state_last =
@@ -585,7 +597,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    // [rs-long-ckpt] a pass longer than K stores only K-1 snapshots; group K-1 receives the pre-pass state below
+    const bool    long_ckpt = rs_long_ckpt_enabled() && n_seq_tokens > K;
+    const int64_t n_written = long_ckpt ? K - 1 : std::min<int64_t>(n_seq_tokens, K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
@@ -601,6 +615,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         (size_t) kv_head * row_size);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+
+    if (long_ckpt) {
+        // [rs-long-ckpt] pre-pass state (the gathered input s, a separate tensor) -> rollback group K-1
+        ggml_tensor * ckpt = ggml_view_2d(ctx0, ssm_states_all,
+            D, n_seqs, ssm_states_all->nb[1],
+            ((size_t) (K - 1) * mem_size + kv_head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, s, ckpt));
+    }
 
     return output;
 }

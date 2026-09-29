@@ -239,6 +239,12 @@ struct server_batch {
     }
 };
 
+// [rs-long-ckpt] LLAMA_RS_LONG_CKPT=1: see src/llama-memory-recurrent.h
+static bool server_rs_long_ckpt() {
+    static const bool v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT"); return e && atoi(e) != 0; }();
+    return v;
+}
+
 struct server_slot {
     int id;
 
@@ -3424,9 +3430,11 @@ private:
             }
 
             if (!draft.empty()) {
+                // [rs-long-ckpt] the recurrent memory keeps the pre-pass state on the device: no host checkpoint
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt) &&
+                    !(server_rs_long_ckpt() && llama_n_rs_seq(ctx_tgt) > 0));
 
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
@@ -4491,9 +4499,17 @@ private:
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
+                // [rs-long-ckpt] after a long pass only n_rs_seq-1 snapshots exist; beyond that the pre-pass state
+                // (kept on the device) is selected by seq_rm and the accepted tokens are replayed
+                const uint32_t n_rs      = llama_n_rs_seq(ctx_tgt);
+                const bool     rs_long   = server_rs_long_ckpt() && n_rs > 0 &&
+                                           ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                                           slot.spec_draft.size() > n_rs;
+                const uint32_t n_snap    = rs_long ? n_rs - 1 : n_rs;
+
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > n_snap);
 
                 // check for partial draft acceptance
                 if (n_rollback > 0) {
@@ -4510,7 +4526,7 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        if (!ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                        if (!rs_long && !ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                             GGML_ABORT("failed to restore speculative checkpoint");
                         }
 

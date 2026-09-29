@@ -76,6 +76,10 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // [rs-long-ckpt] LLAMA_RS_LONG_CKPT=1: tokens of the seq in its last applied ubatch. A pass of T > n_rs_seq + 1
+    // tokens keeps snapshots for rollback 1..n_rs_seq-1 and the pre-pass state (rollback T) in group n_rs_seq.
+    std::vector<uint32_t> rs_last_T;
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build

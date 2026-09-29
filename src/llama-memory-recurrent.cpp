@@ -17,6 +17,14 @@
 // llama_memory_recurrent
 //
 
+#include <cstdlib>
+
+// [rs-long-ckpt] LLAMA_RS_LONG_CKPT=1: see src/llama-memory-recurrent.h
+static bool rs_long_ckpt_enabled() {
+    static const bool v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT"); return e && atoi(e) != 0; }();
+    return v;
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                 ggml_type   type_r,
@@ -34,6 +42,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
+    rs_last_T.assign(n_seq_max, 0);
 
     cells.clear();
     cells.resize(mem_size);
@@ -195,6 +204,23 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
+                // [rs-long-ckpt] after a long pass: snapshots cover rollback 1..n_rs_seq-1, group n_rs_seq = pre-pass
+                const uint32_t T_last = (size_t) seq_id < rs_last_T.size() ? rs_last_T[seq_id] : 0;
+                if (!pending && rs_long_ckpt_enabled() && n_rs_seq > 0 && T_last > n_rs_seq + 1) {
+                    uint32_t idx = 0;
+                    if (rollback >= 1 && rollback < (llama_pos) n_rs_seq) {
+                        idx = (uint32_t) rollback;
+                    } else if (rollback == (llama_pos) T_last) {
+                        idx = n_rs_seq;
+                    }
+                    if (idx != 0) {
+                        set_rs_idx(seq_id, idx);
+                        rs_last_T[seq_id] = 0;
+                        cell.pos = p0 - 1;
+                        return true;
+                    }
+                    return false;
+                }
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
@@ -1261,6 +1287,17 @@ bool llama_memory_recurrent_context::apply() {
     }
 
     mem->find_slot(ubatches[i_next]);
+
+    // [rs-long-ckpt] remember how many tokens each seq got in this pass (decides the rollback layout)
+    {
+        const llama_ubatch & ub = ubatches[i_next];
+        for (uint32_t s = 0; s < ub.n_seqs; ++s) {
+            const llama_seq_id sid = ub.seq_id[s*ub.n_seq_tokens][0];
+            if (sid >= 0 && (size_t) sid < mem->rs_last_T.size()) {
+                mem->rs_last_T[sid] = ub.n_seq_tokens;
+            }
+        }
+    }
 
     return true;
 }
