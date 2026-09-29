@@ -1134,10 +1134,12 @@ void launch_fattn(
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
     // PATCH(fa-kv-chunk): only the MMA kernel (the only caller with stream_k) supports KV chunking
-    const int64_t kv_chunk = stream_k && !use_sparse ? ggml_cuda_fattn_kv_chunk(KQV) : 0;
+    // PATCH(fa-mma-q4): ... and only when K or V is actually converted to F16 (not for the q4_0 tile loader)
+    const bool converts_KV = (need_f16_K && K->type != GGML_TYPE_F16) || (need_f16_V && V->type != GGML_TYPE_F16);
+    const int64_t kv_chunk = stream_k && !use_sparse && converts_KV ? ggml_cuda_fattn_kv_chunk(KQV) : 0;
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, stream_k && !use_sparse);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, stream_k && !use_sparse && converts_KV);
 
     if (kv_chunk > 0) {
         const int ntiles_x_c     = (Q->ne[1] + ncols1 - 1) / ncols1;
