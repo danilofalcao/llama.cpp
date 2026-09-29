@@ -1452,6 +1452,8 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#define GGML_CUDA_GRAPH_OOM_COOLDOWN 256 // PATCH(cuda-graph-oom)
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1468,6 +1470,7 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    int cuda_graph_oom_cooldown = 0; // PATCH(cuda-graph-oom): graphs left to run without CUDA graphs after an OOM
 
     int64_t last_graph_eviction_sweep = 0;
 

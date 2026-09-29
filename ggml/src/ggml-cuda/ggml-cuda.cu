@@ -4391,7 +4391,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            // PATCH(cuda-graph-oom): with tight VRAM, a new graph shape (e.g. several long requests at once) could
+            // fail to instantiate with cudaErrorMemoryAllocation, and CUDA_CHECK aborted the process (rpc-server
+            // crashes on 09-28 06:02 and 09-29 13:24). The captured kernels have not run yet, so drop every cached
+            // graph of this context (freeing their memory), evaluate this graph directly, and skip CUDA graphs for
+            // a while so the capture is not retried on every call.
+            // GGML_CUDA_GRAPH_FAIL_TEST=N (testing only): pretend every Nth instantiation ran out of memory
+            static const int fail_test = [] { const char * e = getenv("GGML_CUDA_GRAPH_FAIL_TEST"); return e ? atoi(e) : 0; }();
+            static int n_instantiate = 0;
+            const bool fake_fail = fail_test > 0 && (++n_instantiate % fail_test) == 0;
+            const cudaError_t err = fake_fail ? cudaErrorMemoryAllocation : cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("%s: cudaGraphInstantiate failed (%s): dropping %zu cached CUDA graphs, running without CUDA graphs for the next %d graphs\n",
+                        __func__, cudaGetErrorString(err), cuda_ctx->cuda_graphs.size(), GGML_CUDA_GRAPH_OOM_COOLDOWN);
+                graph->instance = nullptr;
+                cuda_ctx->cuda_graphs.clear();
+                cuda_ctx->cuda_graph_oom_cooldown = GGML_CUDA_GRAPH_OOM_COOLDOWN;
+                ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, /*use_cuda_graph =*/ false, /*cuda_graph_update_required =*/ false, graph_key);
+                return;
+            }
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -4463,6 +4482,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+#endif // USE_CUDA_GRAPH
+
+#ifdef USE_CUDA_GRAPH
+    if (cuda_ctx->cuda_graph_oom_cooldown > 0) { // PATCH(cuda-graph-oom): recently failed to instantiate, run directly
+        cuda_ctx->cuda_graph_oom_cooldown--;
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
     }
 #endif // USE_CUDA_GRAPH
 
