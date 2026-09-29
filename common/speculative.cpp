@@ -1545,31 +1545,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
+            // PATCH(mtp-prefill-tail): LLAMA_MTP_PREFILL_TAIL=N keeps only the last N tokens of each sequence
+            static const int32_t tail = [] {
+                const char * e = getenv("LLAMA_MTP_PREFILL_TAIL");
+                const int n = e ? atoi(e) : 0;
+                return n > 0 ? n : 0;
+            }();
+
+            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
             for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+                const llama_seq_id sid = batch_in.seq_id[k][0];
+                if (tail > 0 && sid >= 0 && sid < (llama_seq_id) n_seq && k <= i_batch_end[sid] - tail) {
+                    continue; // prefill: position left out of the draft KV
                 }
-
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                const int idx = batch.n_tokens;
+                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { sid }, 0);
+                // row for token k = target h of token k-1 (sequential per seq), or the pending h of the previous call
+                const float * h_row = (k == i_batch_beg[sid]) ? pending_h[sid].data() : h_tgt + (size_t) (k - 1) * n_embd;
+                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1587,7 +1581,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = batch.n_tokens > 0 ? llama_decode(ctx_dft, batch) : 0;
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
