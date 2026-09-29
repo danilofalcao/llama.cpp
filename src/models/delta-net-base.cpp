@@ -18,6 +18,10 @@ static bool rs_long_ckpt_enabled() {
     static const bool v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT"); return e && atoi(e) != 0; }();
     return v;
 }
+static long rs_long_ckpt_max_t() {
+    static const long v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT_MAX_T"); const long n = e ? atol(e) : 64; return n > 0 ? n : 64; }();
+    return v;
+}
 
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
@@ -511,7 +515,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         // [rs-long-ckpt] a pass longer than K keeps the pre-pass conv state in slot K-1 (s_idx 0 = the old state)
         const int64_t T_conv    = conv_input->ne[0] - conv_states->ne[0];
-        const bool    long_ckpt = rs_long_ckpt_enabled() && T_conv > K;
+        const bool    long_ckpt = rs_long_ckpt_enabled() && T_conv > K && T_conv <= rs_long_ckpt_max_t();
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = (long_ckpt && t == 1) ? 0 : std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -598,7 +602,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     // [rs-long-ckpt] a pass longer than K stores only K-1 snapshots; group K-1 receives the pre-pass state below
-    const bool    long_ckpt = rs_long_ckpt_enabled() && n_seq_tokens > K;
+    const bool    long_ckpt = rs_long_ckpt_enabled() && n_seq_tokens > K && n_seq_tokens <= rs_long_ckpt_max_t();
     const int64_t n_written = long_ckpt ? K - 1 : std::min<int64_t>(n_seq_tokens, K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)

@@ -24,6 +24,10 @@ static bool rs_long_ckpt_enabled() {
     static const bool v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT"); return e && atoi(e) != 0; }();
     return v;
 }
+static long rs_long_ckpt_max_t() {
+    static const long v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT_MAX_T"); const long n = e ? atol(e) : 64; return n > 0 ? n : 64; }();
+    return v;
+}
 
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
@@ -206,7 +210,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const bool pending = rs_idx[seq_id] != 0;
                 // [rs-long-ckpt] after a long pass: snapshots cover rollback 1..n_rs_seq-1, group n_rs_seq = pre-pass
                 const uint32_t T_last = (size_t) seq_id < rs_last_T.size() ? rs_last_T[seq_id] : 0;
-                if (!pending && rs_long_ckpt_enabled() && n_rs_seq > 0 && T_last > n_rs_seq + 1) {
+                if (!pending && rs_long_ckpt_enabled() && n_rs_seq > 0 && T_last > n_rs_seq + 1 && T_last <= (uint32_t) rs_long_ckpt_max_t()) {
                     uint32_t idx = 0;
                     if (rollback >= 1 && rollback < (llama_pos) n_rs_seq) {
                         idx = (uint32_t) rollback;
