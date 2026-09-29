@@ -167,8 +167,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+    // PATCH(fa-q4-small): a single query over a q4_0 cache (MTP draft step) runs faster in the 16-column tile
+    // (RTX 5070/4070, D=256, GQA 6: 126->99 / 166->120 us at 32K), so skip the 8-column one there.
+    const bool q4_single_to_16 = ncols2 == 8 && Q->ne[1] == 1 && ggml_cuda_fattn_mma_q4_applies(dst);
     if constexpr (ncols2 <= 8) {
-        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
+        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2 && !q4_single_to_16) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
             return;
         }
@@ -657,13 +660,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         const int n = e ? atoi(e) : 2;
                         return n > 0 ? n : 2;
                     }();
-                    // PATCH(fa-q4-small): GGML_CUDA_FA_MMA_Q4_SMALL=1 keeps batches of 1-2 queries over a q4_0 K/V cache
-                    // (the MTP draft) on the MMA kernel with the q4_0 tile loader, which packs the GQA heads into one tile;
-                    // the vector kernel reads the K/V once per query head.
-                    static const bool mma_q4_small = [] {
+                    // PATCH(fa-q4-small): GGML_CUDA_FA_MMA_Q4_SMALL=N (N >= 1) keeps batches of 1-2 queries over a q4_0 K/V
+                    // cache (the MTP draft) with at least N KV cells on the MMA kernel with the q4_0 tile loader, which packs
+                    // the GQA heads into one tile; the vector kernel reads the K/V once per query head. Below N the vector
+                    // kernel stays (it is faster on a short cache). 0/unset = off.
+                    static const int64_t mma_q4_small_min_kv = [] {
                         const char * e = getenv("GGML_CUDA_FA_MMA_Q4_SMALL");
-                        return e && atoi(e) != 0;
+                        const long long v = e ? atoll(e) : 0;
+                        return (int64_t) (v > 0 ? v : 0);
                     }();
+                    const bool mma_q4_small = mma_q4_small_min_kv > 0 && K->ne[1] >= mma_q4_small_min_kv;
                     if (Q->ne[1] <= vec_max_batch && !(mma_q4_small && gqa_opt_applies && ggml_cuda_fattn_mma_q4_applies(dst) && Q->ne[0] == 256 && V->ne[0] == 256)) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
