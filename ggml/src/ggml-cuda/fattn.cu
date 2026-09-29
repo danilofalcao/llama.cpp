@@ -657,7 +657,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         const int n = e ? atoi(e) : 2;
                         return n > 0 ? n : 2;
                     }();
-                    if (Q->ne[1] <= vec_max_batch) {
+                    // PATCH(fa-q4-small): GGML_CUDA_FA_MMA_Q4_SMALL=1 keeps batches of 1-2 queries over a q4_0 K/V cache
+                    // (the MTP draft) on the MMA kernel with the q4_0 tile loader, which packs the GQA heads into one tile;
+                    // the vector kernel reads the K/V once per query head.
+                    static const bool mma_q4_small = [] {
+                        const char * e = getenv("GGML_CUDA_FA_MMA_Q4_SMALL");
+                        return e && atoi(e) != 0;
+                    }();
+                    if (Q->ne[1] <= vec_max_batch && !(mma_q4_small && gqa_opt_applies && ggml_cuda_fattn_mma_q4_applies(dst) && Q->ne[0] == 256 && V->ne[0] == 256)) {
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 } else {

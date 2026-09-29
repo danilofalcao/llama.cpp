@@ -11346,7 +11346,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // LOCAL(qwen-cluster): Qwen3.5/3.8 27B attention layer (4 KV heads x 256, GQA 6) over a q4_0 cache
     for (int64_t kv : {32768, 131072, 262144}) {
-        for (int64_t nb : {1, 2, 3, 4, 8, 256}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 8, 256}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
     }

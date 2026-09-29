@@ -434,6 +434,80 @@ static __device__ __forceinline__ void flash_attn_ext_q4_0_load_tile(
     }
 }
 
+// PATCH(fa-q4-async): with the 2-stage pipeline (Ampere and newer) the q4_0 K/V rows are first copied raw into a
+// shared-memory staging area with cp.async (16-byte chunks: a 256-wide q4_0 row is 8 blocks = 144 bytes, and the
+// launcher only takes this path when all K/V addresses/strides are multiples of 16), then dequantized from shared
+// memory into the F16 tile with exactly the arithmetic of flash_attn_ext_q4_0_load_tile (bit-identical tiles).
+// The copy is issued where the F16 path issues its cp.async preload, so it overlaps with the KQ / VKQ math.
+template<int D>
+static constexpr __host__ __device__ int flash_attn_ext_q4_0_row_bytes() {
+    return D/QK4_0 * (int) sizeof(block_q4_0);
+}
+
+template<int ncols1, int nbatch_fa>
+static __device__ __forceinline__ char * flash_attn_ext_q4_0_stage_base(half * const tile_mask) {
+    const size_t p = (size_t) (tile_mask + ncols1*(nbatch_fa + 8)); // end of the mask tile (ncols1*(nbatch_fa/2 + 4) half2)
+    return (char *) ((p + 15) & ~size_t(15));
+}
+
+template<int nwarps, int nbatch_fa, int D>
+static __device__ __forceinline__ void flash_attn_ext_q4_0_stage_issue(
+        const half2 * const __restrict__ KV, char * const __restrict__ stage, const int stride_KV, const int k_VKQ_0) {
+    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
+    constexpr int row_bytes      = flash_attn_ext_q4_0_row_bytes<D>();
+    static_assert(row_bytes % 16 == 0, "q4_0 row not a multiple of 16 bytes");
+    constexpr int chunks_per_row = row_bytes/16;
+    constexpr int nchunks        = nbatch_fa*chunks_per_row;
+    const unsigned int stage_32  = ggml_cuda_cvta_generic_to_shared(stage);
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
+        const int c = c0 + tid;
+        if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
+            break;
+        }
+        const int i = c / chunks_per_row;
+        const int p = c - i*chunks_per_row;
+        const char * src = (const char *) KV + int64_t(k_VKQ_0 + i)*stride_KV*int64_t(sizeof(half2)) + p*16;
+        cp_async_cg_16<0>(stage_32 + i*row_bytes + p*16, src);
+    }
+}
+
+template<int stride_tile, bool swz, int nwarps, int nbatch_fa, int D>
+static __device__ __forceinline__ void flash_attn_ext_q4_0_stage_dequant(
+        const char * const __restrict__ stage, half2 * const __restrict__ tile_KV) {
+    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
+    constexpr int h2_per_chunk   = 16/sizeof(half2);
+    constexpr int row_bytes      = flash_attn_ext_q4_0_row_bytes<D>();
+    constexpr int chunks_per_row = D/(2*h2_per_chunk);
+    constexpr int nchunks        = nbatch_fa*chunks_per_row;
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
+        const int idx = c0 + tid;
+        if (c0 + nwarps*warp_size > nchunks && idx >= nchunks) {
+            break;
+        }
+        const int i  = idx / chunks_per_row;
+        const int k  = idx - i*chunks_per_row;
+        const int v0 = k*(2*h2_per_chunk);
+        const block_q4_0 * b = (const block_q4_0 *) (stage + i*row_bytes) + v0/QK4_0;
+        const int  o     = v0 % QK4_0;
+        const int  shift = o < QK4_0/2 ? 0 : 4;
+        const uint16_t * qs = (const uint16_t *) (b->qs + o % (QK4_0/2));
+        const half2 d2 = __half2half2(b->d);
+        half2 out[h2_per_chunk];
+#pragma unroll
+        for (int j = 0; j < h2_per_chunk; ++j) {
+            const uint32_t q  = qs[j];
+            const int      q0 = int((q      >> shift) & 0x0F) - 8;
+            const int      q1 = int((q >> 8 >> shift) & 0x0F) - 8;
+            out[j] = __hmul2(d2, __halves2half2(__int2half_rn(q0), __int2half_rn(q1)));
+        }
+        ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle_bytes<swz, half2>(i, k*h2_per_chunk, stride_tile), out);
+    }
+}
+
 template<int stride_tile, bool swz, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse, bool KV_q4>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         const half2 * const __restrict__ KV_base, half2 * const __restrict__ tile_KV, const int D2, const int stride_KV,
@@ -693,8 +767,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
+        if constexpr (KV_q4) {
+            char * stage_K = flash_attn_ext_q4_0_stage_base<ncols1, nbatch_fa>(tile_mask);
+            char * stage_V = stage_K + nbatch_fa*flash_attn_ext_q4_0_row_bytes<DKQ>();
+            flash_attn_ext_q4_0_stage_dequant<stride_tile_K, swz, nwarps, nbatch_fa, DKQ>(stage_K, tile_K);
+            flash_attn_ext_q4_0_stage_issue<nwarps, nbatch_fa, DV>(V_h2, stage_V, stride_V, k_VKQ_0);
+            __syncthreads();
+        } else {
         flash_attn_ext_f16_load_tile<stride_tile_V, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, KV_q4>
             (V_h2, tile_V, nbatch_V2, stride_V, k_VKQ_0, k_VKQ_sup, nullptr);
+        }
     } else {
         // the sparse mask values are gathered per element, always load them synchronously
         constexpr bool use_cp_async = nstages == 1 && !use_sparse;
@@ -1045,13 +1127,26 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         constexpr bool use_cp_async = true;
         cp_async_wait_all();
         __syncthreads();
+        char * stage_K = nullptr;
+        if constexpr (KV_q4) {
+            stage_K = flash_attn_ext_q4_0_stage_base<ncols1, nbatch_fa>(tile_mask);
+            char * stage_V = stage_K + nbatch_fa*flash_attn_ext_q4_0_row_bytes<DKQ>();
+            flash_attn_ext_q4_0_stage_dequant<stride_tile_V, swz, nwarps, nbatch_fa, DV>(stage_V, tile_V);
+        }
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                     (mask_h, tile_mask, stride_mask, k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
             }
+            if constexpr (KV_q4) {
+                flash_attn_ext_q4_0_stage_issue<nwarps, nbatch_fa, DKQ>(K_h2, stage_K, stride_K, k_VKQ_0 + nbatch_fa);
+            } else {
             flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, KV_q4>
                 (K_h2, tile_K, nbatch_K2, stride_K, k_VKQ_0 + nbatch_fa, k_VKQ_sup, nullptr);
+            }
+        }
+        if constexpr (KV_q4) {
+            __syncthreads(); // tile_V complete before the VKQ math
         }
     }
 
@@ -1403,8 +1498,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
                 (mask_h, tile_mask, stride_mask, kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01, nullptr);
         }
+        if constexpr (KV_q4) {
+            flash_attn_ext_q4_0_stage_issue<nwarps, nbatch_fa, DKQ>
+                (K_h2, flash_attn_ext_q4_0_stage_base<ncols1, nbatch_fa>(tile_mask), stride_K, kb0*nbatch_fa);
+        } else {
         flash_attn_ext_f16_load_tile<stride_tile_K, swz, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse, KV_q4>
             (K_h2, tile_K, nbatch_K2, stride_K, kb0*nbatch_fa, k_VKQ_sup, nullptr);
+        }
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
@@ -2134,11 +2234,14 @@ static bool ggml_cuda_fattn_mma_q4_applies(const ggml_tensor * dst) {
     if (K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 || Q->ne[1] > max_batch) {
         return false;
     }
-    // the loader addresses K/V rows as half2 * (4-byte units)
+    // the loader addresses K/V rows as half2 * (4-byte units); the staged (cp.async) loader copies 16-byte chunks
     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-        if (K->nb[i] % sizeof(half2) != 0 || V->nb[i] % sizeof(half2) != 0) {
+        if (K->nb[i] % 16 != 0 || V->nb[i] % 16 != 0) {
             return false;
         }
+    }
+    if ((uintptr_t) K->data % 16 != 0 || (uintptr_t) V->data % 16 != 0) {
+        return false;
     }
     return true;
 }
@@ -2177,7 +2280,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const size_t nbytes_shared_KV = nstages <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
 
@@ -2205,6 +2308,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         if (logit_softcap == 0.0f && !sparse_wanted && ggml_cuda_fattn_mma_q4_applies(dst)) {
             kv_q4 = true;
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false, true>;
+            if (nstages > 1) {
+                // PATCH(fa-q4-async): raw q4_0 staging for K and V after the mask tile (see flash_attn_ext_q4_0_stage_base)
+                const size_t nbytes_stage_end = (Q_in_reg ? 0 : nbytes_shared_Q) + nbytes_shared_KV + nbytes_shared_mask + 16 +
+                    2*size_t(nbatch_fa)*size_t(flash_attn_ext_q4_0_row_bytes<DKQ>());
+                nbytes_shared_total = std::max(nbytes_shared_total, nbytes_stage_end);
+            }
 #if !defined(GGML_USE_MUSA)
             static bool shared_memory_limit_raised_q4[GGML_CUDA_MAX_DEVICES] = {false};
             if (!shared_memory_limit_raised_q4[id]) {
