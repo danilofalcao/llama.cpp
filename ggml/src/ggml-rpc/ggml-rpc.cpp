@@ -1820,6 +1820,13 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     if (buffer != nullptr) {
         alloc_bytes += buffer->size;
+        static const bool alloc_log = std::getenv("GGML_RPC_ALLOC_LOG") != nullptr; // PATCH(rpc-alloc-log)
+        if (alloc_log) {
+            size_t fr = 0, tot = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(backends[dev_id]), &fr, &tot);
+            GGML_LOG_WARN("[rpc-alloc] +%.1f MiB -> %.1f MiB allocated by the client, device free %.1f MiB\n",
+                    buffer->size/1048576.0, alloc_bytes/1048576.0, fr/1048576.0);
+        }
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
         LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
@@ -1886,6 +1893,9 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         kl.clear();
     }
     alloc_bytes -= std::min(alloc_bytes, buffer->size); // PATCH(rpc-max-alloc)
+    if (std::getenv("GGML_RPC_ALLOC_LOG") != nullptr) { // PATCH(rpc-alloc-log)
+        GGML_LOG_WARN("[rpc-alloc] -%.1f MiB -> %.1f MiB allocated by the client\n", buffer->size/1048576.0, alloc_bytes/1048576.0);
+    }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;

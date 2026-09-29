@@ -585,6 +585,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
+            // PATCH(pool-log): GGML_CUDA_POOL_LOG=1 logs every growth of the VMM pool
+            static const bool pool_log = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+            if (pool_log) {
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                GGML_LOG_WARN("%s[%d]: VMM pool +%.1f MiB -> %.1f MiB (request %.1f MiB, device free %.1f MiB)\n", __func__, device,
+                        reserve_size/1048576.0, (pool_size + reserve_size)/1048576.0, size/1048576.0, free_b/1048576.0);
+            }
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
             // reserve virtual address space (if not already reserved)
@@ -4396,6 +4404,42 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // crashes on 09-28 06:02 and 09-29 13:24). The captured kernels have not run yet, so drop every cached
             // graph of this context (freeing their memory), evaluate this graph directly, and skip CUDA graphs for
             // a while so the capture is not retried on every call.
+            // PATCH(cuda-graph-headroom): instantiated graphs hold device memory, and with several concurrent requests
+            // many graph shapes are live within the 10 s eviction window, so the cache ate the VRAM headroom the pool
+            // needs (09-29: 7-18 cached graphs at every OOM on the 4070). GGML_CUDA_GRAPH_MIN_FREE_MB=N: before
+            // instantiating, evict least recently used graphs of this context while less than N MiB are free.
+            static const size_t graph_min_free = [] {
+                const char * e = getenv("GGML_CUDA_GRAPH_MIN_FREE_MB");
+                return (size_t) (e ? std::max(0, atoi(e)) : 0) * 1024 * 1024;
+            }();
+            if (graph_min_free > 0) {
+                size_t free_b = 0, total_b = 0;
+                int n_evicted = 0;
+                while (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < graph_min_free) {
+                    auto lru = cuda_ctx->cuda_graphs.end();
+                    for (auto it = cuda_ctx->cuda_graphs.begin(); it != cuda_ctx->cuda_graphs.end(); ++it) {
+                        if (it->first == graph_key || it->second->instance == nullptr) {
+                            continue;
+                        }
+                        if (lru == cuda_ctx->cuda_graphs.end() || it->second->last_used_time < lru->second->last_used_time) {
+                            lru = it;
+                        }
+                    }
+                    if (lru == cuda_ctx->cuda_graphs.end()) {
+                        break;
+                    }
+                    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                    cuda_ctx->cuda_graphs.erase(lru);
+                    n_evicted++;
+                }
+                if (n_evicted > 0) {
+                    static int n_log = 0;
+                    if (n_log++ < 20) {
+                        GGML_LOG_WARN("%s: evicted %d CUDA graphs to keep %zu MiB free (now %.0f MiB free, %zu cached)\n", __func__,
+                                n_evicted, graph_min_free/1048576, free_b/1048576.0, cuda_ctx->cuda_graphs.size());
+                    }
+                }
+            }
             // GGML_CUDA_GRAPH_FAIL_TEST=N (testing only): pretend every Nth instantiation ran out of memory
             static const int fail_test = [] { const char * e = getenv("GGML_CUDA_GRAPH_FAIL_TEST"); return e ? atoi(e) : 0; }();
             static int n_instantiate = 0;
