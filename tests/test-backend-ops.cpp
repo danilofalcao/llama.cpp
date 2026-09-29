@@ -10731,6 +10731,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // PATCH(fa-mma-q4): decode / speculative-verification shapes over a q4_0 KV cache with 256-wide heads
+    // (Qwen3.8-27B: 4 KV heads, GQA 6). Small batches of 3..16 queries run the MMA kernel; with
+    // GGML_CUDA_FA_MMA_Q4 set it reads the q4_0 K/V directly through the q4_0 tile loader.
+    for (int nr2 : { 1, 2, 6, }) {
+        for (int kv : { 113, 512, 1024, 4096, }) {
+            for (int nb : { 1, 2, 3, 5, 8, 16, }) {
+                for (bool sinks : { false, true, }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {nr2, 1}, kv, nb, true, sinks, 0.0f, 0.0f,
+                        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false));
+                }
+            }
+        }
+    }
+
     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
     for (int kv : { 1024, 2048, }) {
