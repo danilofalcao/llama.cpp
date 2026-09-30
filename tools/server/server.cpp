@@ -13,6 +13,10 @@
 #include "log.h"
 
 #include <atomic>
+#include <mutex>
+#include <vector>
+#include <memory>
+#include <chrono>
 #include <clocale>
 #include <exception>
 #include <signal.h>
@@ -22,8 +26,23 @@
 #include <windows.h>
 #endif
 
-static std::function<void(int)> shutdown_handler;
+// [multi] every instance registers its handler; a signal stops all of them
+static std::vector<std::function<void(int)>> shutdown_handlers;
+static std::mutex shutdown_handlers_mutex;
+struct shutdown_handler_t {
+    void operator=(std::function<void(int)> f) { std::lock_guard<std::mutex> lk(shutdown_handlers_mutex); shutdown_handlers.push_back(std::move(f)); }
+    explicit operator bool() const { std::lock_guard<std::mutex> lk(shutdown_handlers_mutex); return !shutdown_handlers.empty(); }
+    void operator()(int sig) const {
+        std::vector<std::function<void(int)>> hs;
+        { std::lock_guard<std::mutex> lk(shutdown_handlers_mutex); hs = shutdown_handlers; }
+        for (auto & h : hs) { h(sig); }
+    }
+};
+static shutdown_handler_t shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+// [multi] llama_backend_free only when the last instance leaves
+static std::atomic<int> live_instances{0};
+static void backend_free_last() { if (--live_instances <= 0) { llama_backend_free(); } }
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -116,8 +135,20 @@ int llama_server(int argc, char ** argv) {
     return result;
 }
 
+static int llama_server_multi(common_params & params, int argc, char ** argv, int n_inst);
+
 int llama_server(common_params & params, int argc, char ** argv) {
     bool is_run_by_cli = (argv == nullptr);
+
+    // [multi] LLAMA_MULTI=N: N instances (threads) sharing the model + a proxy on the base port
+    {
+        static const int n_multi = [] { const char * e = getenv("LLAMA_MULTI"); return e ? atoi(e) : 0; }();
+        static std::atomic<bool> multi_entered{false};
+        if (n_multi > 1 && !is_run_by_cli && !multi_entered.exchange(true)) {
+            return llama_server_multi(params, argc, argv, n_multi);
+        }
+    }
+    live_instances++;
 
     common_models_handler models_handler;
 
@@ -417,7 +448,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 models_routes->models.unload_all();
             }
             mcp_mgr.shutdown();
-            llama_backend_free();
+            backend_free_last();
         };
 
         if (!ctx_http.start()) {
@@ -455,7 +486,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
             ctx_http.stop();
             ctx_server.terminate();
             mcp_mgr.shutdown();
-            llama_backend_free();
+            backend_free_last();
         };
 
         // start the HTTP server before loading the model to be able to serve /health requests
@@ -553,5 +584,94 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    return 0;
+}
+
+
+// ============================ [multi] N instances + proxy ============================
+#include "server-models.h"
+
+static int llama_server_multi(common_params & params, int argc, char ** argv, int n_inst) {
+    const int base_port = params.port;
+    struct inst_t { int port; std::atomic<int> busy{0}; std::thread th; int rc = 0; };
+    std::vector<std::unique_ptr<inst_t>> insts;
+
+    auto wait_ready = [&](int port, int timeout_s) {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_connection_timeout(2); cli.set_read_timeout(5);
+        for (int i = 0; i < timeout_s; ++i) {
+            auto r = cli.Get("/health");
+            if (r && r->status == 200) { return true; }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        return false;
+    };
+
+    for (int i = 0; i < n_inst; ++i) {
+        auto inst = std::make_unique<inst_t>();
+        inst->port = base_port + 1 + i;
+        common_params p = params;
+        p.port = inst->port;
+        inst_t * ip = inst.get();
+        inst->th = std::thread([ip, p, argc, argv]() mutable {
+            ip->rc = llama_server(p, argc, argv);
+        });
+        SRV_INF("[multi] instance %d starting on port %d\n", i, inst->port);
+        // instances load one after the other (the first loads the weights, the rest reuse them)
+        if (!wait_ready(inst->port, 1800)) {
+            SRV_ERR("[multi] instance %d on port %d did not become ready\n", i, inst->port);
+            return 1;
+        }
+        SRV_INF("[multi] instance %d ready on port %d\n", i, inst->port);
+        insts.push_back(std::move(inst));
+    }
+
+    // proxy on the base port
+    common_params pp = params;
+    pp.port = base_port;
+    pp.api_keys.clear();         // the instances check the key themselves
+    server_http_context ctx_http;
+    if (!ctx_http.init(pp)) {
+        SRV_ERR("%s", "[multi] failed to initialize the proxy HTTP server\n");
+        return 1;
+    }
+    auto pick = [&]() -> inst_t * {
+        inst_t * best = nullptr;
+        for (auto & in : insts) {
+            if (!best || in->busy.load() < best->busy.load()) { best = in.get(); }
+        }
+        return best;
+    };
+    auto forward = [&](const std::string & method) {
+        return [&, method](const server_http_req & req) -> server_http_res_ptr {
+            inst_t * in = pick();
+            in->busy++;
+            std::string path = req.path;
+            if (!req.query_string.empty()) { path += '?' + req.query_string; }
+            auto proxy = std::make_unique<server_http_proxy>(method, "http", "127.0.0.1", in->port, path,
+                    req.headers, req.body, req.files, req.should_stop, params.timeout_read, params.timeout_write);
+            proxy->cleanup = [in]() { in->busy--; };
+            return proxy;
+        };
+    };
+    const char * gets[]  = { "/health", "/metrics", "/props", "/models", "/v1/models", "/api/tags", "/slots", "/api/version" };
+    const char * posts[] = { "/completion", "/completions", "/v1/completions", "/chat/completions", "/v1/chat/completions",
+                             "/v1/messages", "/v1/responses", "/infill", "/embedding", "/embeddings", "/v1/embeddings",
+                             "/rerank", "/reranking", "/v1/rerank", "/v1/reranking", "/tokenize", "/detokenize",
+                             "/apply-template", "/props", "/api/show", "/slots/:id_slot" };
+    for (auto p : gets)  { ctx_http.get(p, forward("GET")); }
+    for (auto p : posts) { ctx_http.post(p, forward("POST")); }
+
+    if (!ctx_http.start()) {
+        SRV_ERR("%s", "[multi] proxy HTTP server failed to start\n");
+        return 1;
+    }
+    ctx_http.is_ready.store(true);
+    SRV_INF("[multi] proxy listening on port %d, %d instances on %d..%d\n", base_port, n_inst, base_port + 1, base_port + n_inst);
+
+    shutdown_handler = [&](int) { ctx_http.stop(); };
+
+    ctx_http.join();
+    for (auto & in : insts) { if (in->th.joinable()) { in->th.join(); } }
     return 0;
 }

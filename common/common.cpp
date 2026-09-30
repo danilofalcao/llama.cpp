@@ -11,6 +11,8 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -1272,7 +1274,14 @@ static void common_init_sampler_from_model(
 
 struct common_init_result::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        // [multi] a cached (shared) model is owned by the registry, not by this result
+        if (model_shared) {
+            context.reset();            // the context must go before the model
+            (void) model.release();
+        }
+    }
+    bool model_shared = false;
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
@@ -1326,9 +1335,30 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
-    if (model == NULL) {
-        return;
+    // [multi] LLAMA_MULTI: share one loaded model between the instances of this process (keyed by path)
+    static std::mutex model_cache_mutex;
+    static std::map<std::string, llama_model *> model_cache;
+    static const bool model_cache_on = [] { const char * e = getenv("LLAMA_MULTI"); return e && atoi(e) > 1; }();
+    llama_model * model = nullptr;
+    if (model_cache_on) {
+        std::lock_guard<std::mutex> lk(model_cache_mutex);
+        auto it = model_cache.find(params.model.path);
+        if (it != model_cache.end()) {
+            model = it->second;
+            pimpl->model_shared = true;
+            COM_INF("[multi] reusing loaded model %s\n", params.model.path.c_str());
+        }
+    }
+    if (model == nullptr) {
+        model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        if (model == NULL) {
+            return;
+        }
+        if (model_cache_on) {
+            std::lock_guard<std::mutex> lk(model_cache_mutex);
+            model_cache[params.model.path] = model;
+            pimpl->model_shared = true;   // the registry keeps it alive for the whole process
+        }
     }
 
     pimpl->model.reset(model);
