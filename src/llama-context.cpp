@@ -675,7 +675,7 @@ void llama_context::pp_rereserve(uint32_t n_tokens_all) {
     sched_n_realloc_seen = ggml_backend_sched_get_n_realloc(sched.get());
 
     if (verbose) {
-        LLAMA_LOG_INFO("%s: %lld scheduler reallocation(s) since the last worst-case prompt reservation; re-reserved in %.2f ms\n",
+        LLAMA_LOG_WARN("%s: %lld scheduler reallocation(s) since the last worst-case prompt reservation; re-reserved in %.2f ms\n",
                 __func__, (long long) (n_realloc - n_before), (ggml_time_us() - t0) / 1000.0);
     }
 }
