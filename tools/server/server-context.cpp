@@ -3408,9 +3408,22 @@ private:
         }
 
         // make checkpoints if needed
+        // [rs-long-ckpt] long drafts only when a single slot is busy (see below)
+        int n_busy_slots = 0;
+        for (const auto & s : slots) {
+            n_busy_slots += s.is_processing() ? 1 : 0;
+        }
+
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
+
+            // [rs-long-ckpt] with other sequences in the batch, split_equal may split this slot's verify tokens over two
+            // ubatches: the device-side pre-pass state would then be the second ubatch's -> keep drafts within the snapshots
+            if (server_rs_long_ckpt() && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_busy_slots > 1 &&
+                llama_n_rs_seq(ctx_tgt) > 0 && draft.size() > llama_n_rs_seq(ctx_tgt)) {
+                draft.resize(llama_n_rs_seq(ctx_tgt));
+            }
 
             slot.stats.n_draft_tokens += draft.size();
 
