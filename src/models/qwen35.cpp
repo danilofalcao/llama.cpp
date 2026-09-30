@@ -217,8 +217,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     if (xdev_type != GGML_TYPE_COUNT && n_tokens < qwen35_xdev_min_tokens()) {
         xdev_type = GGML_TYPE_F32;
     }
+    // PATCH(embd-remote): with token_embd moved off the host (-ot token_embd.weight=<device>) the rows are gathered
+    // on that device and only the token ids cross; narrowing there would pull the embeddings back to the CPU
     if (xdev_type != GGML_TYPE_COUNT && n_layer > 0 &&
-        ggml_backend_dev_type(model.dev_layer(0)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        ggml_backend_dev_type(model.dev_layer(0)) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+        (model.tok_embd == nullptr || model.tok_embd->buffer == nullptr || ggml_backend_buffer_is_host(model.tok_embd->buffer))) {
         inpL = ggml_cast(ctx0, inpL, xdev_type);
         cb(inpL, "xdev_embd", -1);
         inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
