@@ -646,12 +646,10 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
         SRV_ERR("%s", "[multi] failed to initialize the proxy HTTP server\n");
         return 1;
     }
-    // first instance with a free slot (the first instance has the big context and the warm cache); if all are full,
-    // the least loaded relative to its capacity
-    auto pick = [&]() -> inst_t * {
-        for (auto & in : insts) {
-            if (in->busy.load() < in->cap) { return in.get(); }
-        }
+    // LLAMA_MULTI_ROUTE: first (first instance with a free slot), least (least loaded), hash (default: conversation
+    // affinity = hash of the first user message -> instance, so a session keeps its prompt cache; spill when full)
+    static const std::string route = [] { const char * e = getenv("LLAMA_MULTI_ROUTE"); return std::string(e ? e : "hash"); }();
+    auto least_loaded = [&]() -> inst_t * {
         inst_t * best = nullptr; double best_load = 1e9;
         for (auto & in : insts) {
             const double load = (double) in->busy.load() / in->cap;
@@ -659,9 +657,32 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
         }
         return best;
     };
+    auto pick = [&](const std::string & body) -> inst_t * {
+        if (route == "first") {
+            for (auto & in : insts) { if (in->busy.load() < in->cap) { return in.get(); } }
+            return least_loaded();
+        }
+        if (route == "hash") {
+            std::string key;
+            try {
+                auto j = json::parse(body);
+                if (j.contains("messages")) {
+                    for (const auto & m : j["messages"]) {
+                        if (m.value("role", "") == "user") { key = m.value("content", json()).dump(); break; }
+                    }
+                }
+            } catch (...) {}
+            if (!key.empty()) {
+                inst_t * in = insts[std::hash<std::string>{}(key) % insts.size()].get();
+                if (in->busy.load() < in->cap) { return in; }
+                for (auto & o : insts) { if (o->busy.load() < o->cap) { return o.get(); } }
+            }
+        }
+        return least_loaded();
+    };
     auto forward = [&](const std::string & method) {
         return [&, method](const server_http_req & req) -> server_http_res_ptr {
-            inst_t * in = pick();
+            inst_t * in = pick(req.body);
             in->busy++;
             std::string path = req.path;
             if (!req.query_string.empty()) { path += '?' + req.query_string; }
