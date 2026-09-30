@@ -13,6 +13,8 @@
 #include "log.h"
 
 #include <atomic>
+#include <deque>
+#include <unordered_map>
 #include <mutex>
 #include <vector>
 #include <memory>
@@ -648,7 +650,7 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
     }
     // LLAMA_MULTI_ROUTE: first (first instance with a free slot), least (least loaded), hash (default: conversation
     // affinity = hash of the first user message -> instance, so a session keeps its prompt cache; spill when full)
-    static const std::string route = [] { const char * e = getenv("LLAMA_MULTI_ROUTE"); return std::string(e ? e : "hash"); }();
+    static const std::string route = [] { const char * e = getenv("LLAMA_MULTI_ROUTE"); return std::string(e ? e : "sticky"); }();
     auto least_loaded = [&]() -> inst_t * {
         inst_t * best = nullptr; double best_load = 1e9;
         for (auto & in : insts) {
@@ -657,10 +659,43 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
         }
         return best;
     };
+    // conversation key = first user message (stable across the turns of one session)
+    auto conv_key = [](const std::string & body) -> std::string {
+        try {
+            auto j = json::parse(body);
+            if (j.contains("messages")) {
+                for (const auto & m : j["messages"]) {
+                    if (m.value("role", "") == "user") { return m.value("content", json()).dump(); }
+                }
+            }
+        } catch (...) {}
+        return "";
+    };
+    // sticky: a conversation goes back to the instance that served it (its prompt cache lives there) if that
+    // instance has a free slot; otherwise first free slot; the pin follows the request
+    static std::mutex pins_mutex;
+    static std::unordered_map<std::string, inst_t *> pins;
+    static std::deque<std::string> pins_order;
     auto pick = [&](const std::string & body) -> inst_t * {
-        if (route == "first") {
-            for (auto & in : insts) { if (in->busy.load() < in->cap) { return in.get(); } }
-            return least_loaded();
+        if (route == "first" || route == "sticky") {
+            inst_t * chosen = nullptr;
+            const std::string key = route == "sticky" ? conv_key(body) : "";
+            if (!key.empty()) {
+                std::lock_guard<std::mutex> lk(pins_mutex);
+                auto it = pins.find(key);
+                if (it != pins.end() && it->second->busy.load() < it->second->cap) { chosen = it->second; }
+            }
+            if (!chosen) {
+                for (auto & in : insts) { if (in->busy.load() < in->cap) { chosen = in.get(); break; } }
+            }
+            if (!chosen) { chosen = least_loaded(); }
+            if (!key.empty()) {
+                std::lock_guard<std::mutex> lk(pins_mutex);
+                if (pins.find(key) == pins.end()) { pins_order.push_back(key); }
+                pins[key] = chosen;
+                while (pins_order.size() > 2000) { pins.erase(pins_order.front()); pins_order.pop_front(); }
+            }
+            return chosen;
         }
         if (route == "hash") {
             std::string key;
