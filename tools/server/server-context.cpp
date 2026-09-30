@@ -3414,6 +3414,22 @@ private:
             n_busy_slots += s.is_processing() ? 1 : 0;
         }
 
+        // [spec-equalize] equal draft lengths across the slots drafting in this step -> a single ubatch (one weight read)
+        {
+            static const bool eq = [] { const char * e = getenv("LLAMA_SPEC_EQUALIZE"); return !e || atoi(e) != 0; }();
+            size_t n_min = SIZE_MAX; int n_nonempty = 0;
+            for (const auto * s : drafting) {
+                if (!s->spec_draft.empty()) { n_min = std::min(n_min, s->spec_draft.size()); n_nonempty++; }
+            }
+            if (eq && n_nonempty > 1) {
+                for (auto * s : drafting) {
+                    if (s->spec_draft.size() > n_min) {
+                        s->spec_draft.resize(n_min);
+                    }
+                }
+            }
+        }
+
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
