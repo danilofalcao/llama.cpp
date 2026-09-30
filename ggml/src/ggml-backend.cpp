@@ -838,6 +838,9 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // PATCH(pp-rereserve): number of reallocations done by ggml_backend_sched_alloc_splits
+    int64_t n_realloc;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1611,6 +1614,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        sched->n_realloc++; // PATCH(pp-rereserve)
         // PATCH(sched-log-realloc): GGML_SCHED_LOG_REALLOC=1 logs every reallocation (each one synchronizes all backends)
         static const bool log_realloc = getenv("GGML_SCHED_LOG_REALLOC") != nullptr;
         if (log_realloc) {
@@ -2076,6 +2080,16 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+// PATCH(pp-rereserve): not declared in ggml-backend.h on purpose (a header change rebuilds every backend);
+// llama-context.cpp declares it. Number of reallocations of the scheduler (each one synchronizes all backends).
+extern "C" {
+    GGML_API int64_t ggml_backend_sched_get_n_realloc(ggml_backend_sched_t sched);
+}
+int64_t ggml_backend_sched_get_n_realloc(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_realloc;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

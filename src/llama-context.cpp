@@ -614,6 +614,72 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// PATCH(pp-rereserve): exported by ggml-base, deliberately not declared in ggml-backend.h
+extern "C" int64_t ggml_backend_sched_get_n_realloc(ggml_backend_sched_t sched);
+
+// PATCH(pp-rereserve): the worst-case prompt reservation made in sched_reserve() is what lets every prompt
+// ubatch fit the scheduler's allocation plan. A graph of another shape (e.g. an rs-long-ckpt verify batch, whose
+// extra nodes also move a view to another backend) makes ggml_backend_sched_alloc_splits re-plan for THAT graph
+// at the current, small KV size. Every later prompt ubatch then has a larger n_kv than the plan and reallocates
+// again, and each reallocation synchronizes all backends, which removes the overlap between the RPC device and
+// the local GPU (measured: prefill 22K 1096 -> 846 t/s, 97 reallocations in 96 ubatches, until a restart).
+// Before a prompt-sized batch, if the scheduler reallocated since the last worst-case reservation, reserve the
+// worst-case prompt graph again: one synchronization per prompt instead of one per ubatch.
+// LLAMA_PP_RERESERVE=0 disables; LLAMA_PP_RERESERVE_MIN (default 64) = smallest batch treated as a prompt;
+// LLAMA_PP_RERESERVE_LOG=1 logs each re-reservation.
+void llama_context::pp_rereserve(uint32_t n_tokens_all) {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_PP_RERESERVE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    static const uint32_t n_min = [] {
+        const char * e = getenv("LLAMA_PP_RERESERVE_MIN");
+        return e != nullptr ? (uint32_t) atoi(e) : 64u;
+    }();
+    static const bool verbose = getenv("LLAMA_PP_RERESERVE_LOG") != nullptr;
+
+    if (!enabled || !memory || n_tokens_all < n_min || model.hparams.no_alloc) {
+        return;
+    }
+    const int64_t n_realloc = ggml_backend_sched_get_n_realloc(sched.get());
+    if (n_realloc == sched_n_realloc_seen) {
+        return;
+    }
+
+    const int64_t t0 = ggml_time_us();
+
+    synchronize();
+
+    auto mctx = memory->init_full();
+    if (!mctx) {
+        sched_n_realloc_seen = n_realloc;
+        return;
+    }
+    const uint32_t n_seqs       = cparams.n_seq_max;
+    const uint32_t n_tokens     = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    ggml_cgraph * gf = nullptr;
+    switch (model.arch) {
+        case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_MINIMAX_01:
+            gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get());
+            break;
+        default:
+            gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+    }
+    if (!gf) {
+        LLAMA_LOG_WARN("%s: worst-case prompt re-reservation failed; the scheduler re-plans per ubatch\n", __func__);
+    }
+    const int64_t n_before = sched_n_realloc_seen;
+    sched_n_realloc_seen = ggml_backend_sched_get_n_realloc(sched.get());
+
+    if (verbose) {
+        LLAMA_LOG_INFO("%s: %lld scheduler reallocation(s) since the last worst-case prompt reservation; re-reserved in %.2f ms\n",
+                __func__, (long long) (n_realloc - n_before), (ggml_time_us() - t0) / 1000.0);
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -641,6 +707,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched_n_realloc_seen = 0; // PATCH(pp-rereserve): new scheduler
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1798,6 +1865,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     output_swaps.clear();
 
     sched_reserve();
+
+    pp_rereserve(n_tokens_all); // PATCH(pp-rereserve)
 
     bool did_optimize = false;
 

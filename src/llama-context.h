@@ -349,6 +349,10 @@ private:
 
     bool sched_need_reserve = true;
 
+    // PATCH(pp-rereserve): scheduler reallocation count at the last worst-case prompt reservation
+    int64_t sched_n_realloc_seen = 0;
+    void pp_rereserve(uint32_t n_tokens_all);
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
