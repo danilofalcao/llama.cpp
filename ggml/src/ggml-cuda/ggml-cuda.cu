@@ -4469,6 +4469,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
+// PATCH(rpc-pipeline): set (same thread) right before a graph_compute whose stream is parked on a host function waiting
+// for data from an RPC device. Launching ~2000 kernels one by one behind that wait fills the stream's launch queue and
+// blocks the CPU in cuLaunchKernel until the data arrives; a captured CUDA graph is a single launch. The capture is
+// forced even though the graph's properties change every ubatch (prompt processing), and the regular path re-warms
+// (and re-captures) afterwards, so its cached instance is never reused with this graph's kernels.
+static thread_local ggml_backend_cuda_context * ggml_cuda_force_capture_ctx = nullptr;
+
+static void ggml_backend_cuda_force_graph_capture(ggml_backend_t backend) {
+    ggml_cuda_force_capture_ctx = (ggml_backend_cuda_context *) backend->context;
+}
+
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -4500,7 +4511,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    const bool force_capture = ggml_cuda_force_capture_ctx == cuda_ctx; // PATCH(rpc-pipeline)
+    ggml_cuda_force_capture_ctx = nullptr;
+    if (graph->is_enabled() && force_capture && ggml_cuda_graph_check_compability(cgraph)) {
+        use_cuda_graph             = true;
+        cuda_graph_update_required = true;
+        graph->warmup_complete     = false; // the regular path re-captures before reusing the instance
+    } else if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -5831,6 +5848,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_enqueue_host_func") == 0) { // PATCH(rpc-pipeline)
         return (void *)ggml_backend_cuda_enqueue_host_func;
+    }
+    if (strcmp(name, "ggml_backend_cuda_force_graph_capture") == 0) { // PATCH(rpc-pipeline)
+        return (void *)ggml_backend_cuda_force_graph_capture;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

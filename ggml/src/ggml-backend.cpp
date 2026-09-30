@@ -1749,6 +1749,10 @@ static bool ggml_sched_pipe_can_host_wait(ggml_backend_sched_t sched, int backen
 
 // fetch `input` (on the RPC backend src) into a staging slot and make dst's stream copy it into input_cpy once it
 // has arrived; returns false if not possible (the caller falls back to the synchronous copy)
+typedef void (*sched_trace_t)(const char *, int, size_t);
+static sched_trace_t ggml_sched_trace_fn(ggml_backend_sched_t sched);
+#define SCHED_TRACE(tag, a, b) do { sched_trace_t tf_ = ggml_sched_trace_fn(sched); if (tf_) tf_(tag, a, b); } while (0)
+
 static bool ggml_sched_pipe_copy(ggml_backend_sched_t sched, ggml_backend_t src, ggml_backend_t dst,
                                  struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
     auto * p = sched->pipe;
@@ -1770,7 +1774,9 @@ static bool ggml_sched_pipe_copy(ggml_backend_sched_t sched, ggml_backend_t src,
 
     ggml_sched_pipe_slot & s = p->slots[p->next];
     if (s.used && s.ev != nullptr) {
+        SCHED_TRACE("Pev0", p->next, 0);
         ggml_backend_event_synchronize(s.ev); // the copy out of this slot (a few ubatches ago) is done
+        SCHED_TRACE("Pev1", p->next, 0);
     }
     if (s.buf == nullptr || s.dev != dev || s.size < n) {
         if (s.buf != nullptr) {
@@ -1797,9 +1803,19 @@ static bool ggml_sched_pipe_copy(ggml_backend_sched_t sched, ggml_backend_t src,
         return false;
     }
     p->next = (p->next + 1) % (int) p->slots.size();
+    {
+        static int64_t n_async = 0;
+        if (n_async++ == 0 || getenv("GGML_RPC_PIPELINE_LOG") != nullptr) {
+            GGML_LOG_WARN("%s: rpc-pipeline: async %s -> %s copy of %zu bytes (#%lld)\n", __func__,
+                          ggml_backend_name(src), ggml_backend_name(dst), n, (long long) n_async);
+        }
+    }
     enq(dst, wait, h);                                          // dst's stream waits until the data is in `stage`
+    SCHED_TRACE("Penq", 0, n);
     ggml_backend_tensor_set_async(dst, input_cpy, stage, 0, n); // then copies it (stream-ordered after dst's work)
+    SCHED_TRACE("Pset", 0, n);
     ggml_backend_event_record(s.ev, dst);
+    SCHED_TRACE("Prec", 0, n);
     s.used = true;
     return true;
 }
@@ -1824,9 +1840,24 @@ static void ggml_sched_pipe_free(ggml_backend_sched_t sched) {
     sched->pipe = nullptr;
 }
 
+// PATCH(rpc-trace): scheduler events into the same trace (C = compute_splits enter/exit, Y = synchronize(backend))
+static sched_trace_t ggml_sched_trace_fn(ggml_backend_sched_t sched) {
+    static sched_trace_t fn = nullptr;
+    static bool looked = false;
+    static const bool enabled = getenv("GGML_RPC_TRACE") != nullptr;
+    if (!looked && enabled) {
+        for (int i = 0; i < sched->n_backends && fn == nullptr; i++) {
+            fn = (sched_trace_t) ggml_sched_backend_proc(sched->backends[i], "ggml_backend_rpc_trace");
+        }
+        looked = fn != nullptr;
+    }
+    return fn;
+}
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_sched_pipe * pipe = ggml_sched_pipe_get(sched); // PATCH(rpc-pipeline)
+    SCHED_TRACE("Cin", sched->n_splits, sched->graph.n_nodes);
+    struct trace_exit_ { ggml_backend_sched_t sched; ~trace_exit_() { SCHED_TRACE("Cout", 0, 0); } } trace_exit_{sched};
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -1850,6 +1881,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // PATCH(rpc-pipeline): RPC outputs copied asynchronously are enqueued AFTER the other inputs of the split: the
+        // synchronize() before a user-input copy must wait only for the previous use of the split's buffers, not for
+        // the host function that waits on this ubatch's RPC result (that would block the CPU for the whole RPC pass)
+        int deferred[GGML_SCHED_MAX_SPLIT_INPUTS];
+        int n_deferred = 0;
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1866,22 +1903,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
+                    SCHED_TRACE("Yi0", split_backend_id, input_id);
                     ggml_backend_synchronize(split_backend);
+                    SCHED_TRACE("Yi1", split_backend_id, input_id);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
-                // PATCH(rpc-pipeline): output of an RPC device -> asynchronous, stream-ordered copy (no CPU wait)
+                // PATCH(rpc-pipeline): host data -> RPC device: the server runs commands in order and set_tensor_async copies
+                // the data into the message at once, so neither backend needs to be synchronized (a synchronize of the RPC
+                // backend would wait for this ubatch's pending RPC result). The host producer (CPU split) is synchronous.
+                if (pipe != nullptr && ggml_backend_buffer_is_host(input->buffer) && ggml_sched_pipe_is_rpc(sched, split_backend_id)) {
+                    ggml_backend_synchronize(input_backend);
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    continue;
+                }
+                // PATCH(rpc-pipeline): output of an RPC device -> asynchronous, stream-ordered copy (no CPU wait), deferred
                 if (pipe != nullptr && ggml_nbytes(input) >= pipe->min_bytes && input_backend != split_backend &&
+                    n_deferred < GGML_SCHED_MAX_SPLIT_INPUTS &&
                     ggml_sched_pipe_is_rpc(sched, ggml_backend_sched_backend_id(sched, input_backend)) &&
-                    ggml_sched_pipe_can_host_wait(sched, split_backend_id) &&
-                    ggml_sched_pipe_copy(sched, input_backend, split_backend, input, input_cpy)) {
+                    ggml_sched_pipe_can_host_wait(sched, split_backend_id)) {
+                    deferred[n_deferred++] = input_id;
                     continue;
                 }
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
+                    SCHED_TRACE("Yn0", split_backend_id, input_id);
                     ggml_backend_synchronize(split_backend);
+                    SCHED_TRACE("Yn1", split_backend_id, input_id);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1989,8 +2039,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // PATCH(rpc-pipeline): the deferred RPC outputs
+        bool parked = false;
+        for (int d = 0; d < n_deferred; d++) {
+            struct ggml_tensor * input = split->inputs[deferred[d]];
+            ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+            struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            if (ggml_sched_pipe_copy(sched, input_backend, split_backend, input, input_cpy)) {
+                parked = true;
+            } else {
+                ggml_backend_synchronize(input_backend);
+                ggml_backend_synchronize(split_backend);
+                ggml_backend_tensor_copy(input, input_cpy);
+            }
+        }
+        if (parked && !sched->callback_eval) {
+            // the stream waits on a host function: launch the split as one captured CUDA graph (see ggml-cuda.cu)
+            typedef void (*force_capture_t)(ggml_backend_t);
+            static const bool use_capture = [] { const char * e = getenv("GGML_RPC_PIPELINE_CAPTURE"); return e == nullptr || atoi(e) != 0; }();
+            force_capture_t fc = use_capture ? (force_capture_t) ggml_sched_backend_proc(split_backend, "ggml_backend_cuda_force_graph_capture") : nullptr;
+            if (fc != nullptr) {
+                fc(split_backend);
+            }
+        }
+
         if (!sched->callback_eval) {
+            SCHED_TRACE("G0", split_backend_id, split->graph.n_nodes);
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            SCHED_TRACE("G1", split_backend_id, split->graph.n_nodes);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }

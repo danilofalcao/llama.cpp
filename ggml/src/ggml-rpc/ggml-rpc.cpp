@@ -506,6 +506,20 @@ private:
     std::thread      rthread;
 };
 
+// PATCH(rpc-trace): GGML_RPC_TRACE=<file> appends "t_us tag cmd size" lines (writer: S=sent, reader: R=response)
+static FILE * rpc_trace_file() {
+    static FILE * f = [] { const char * e = std::getenv("GGML_RPC_TRACE"); return e ? fopen(e, "a") : (FILE *) nullptr; }();
+    return f;
+}
+static void rpc_trace(const char * tag, int cmd, size_t size) {
+    FILE * f = rpc_trace_file();
+    if (f) {
+        static std::mutex m;
+        std::lock_guard<std::mutex> lk(m);
+        fprintf(f, "%lld %s %d %zu\n", (long long) ggml_time_us(), tag, cmd, size);
+    }
+}
+
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
 {
     dispatcher->work();
@@ -644,6 +658,7 @@ void rpc_dispatcher::work() {
             if (msg_ptr->cmd != RPC_CMD_NONE) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
                 RPC_STATUS_ASSERT(status);
+                rpc_trace("S", msg_ptr->cmd, msg_ptr->input_size);
             }
             if (!rqueue.push(msg_ptr)) {
                 break;
@@ -678,6 +693,7 @@ void rpc_dispatcher::read_work() {
                 break;
             }
             RPC_STATUS_ASSERT(status);
+            rpc_trace("R", msg_ptr->cmd, msg_ptr->output_size);
         }
         msg_ptr->completion.set_value();
     }
@@ -3025,9 +3041,50 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
+    // PATCH(rpc-server-stats): GGML_RPC_SERVER_STATS=N prints, every N graph computations, how the server thread
+    // spent its time: idle (waiting for the next command byte) and per command (receiving its payload + work + reply)
+    static const int stats_every = [] { const char * e = std::getenv("GGML_RPC_SERVER_STATS"); return e ? std::atoi(e) : 0; }();
+    struct cmd_stat { int64_t us = 0; int64_t n = 0; };
+    std::vector<cmd_stat> st(RPC_CMD_COUNT);
+    int64_t st_idle_us = 0, st_graphs = 0, st_t0 = ggml_time_us();
+    int64_t st_t_wait = ggml_time_us();
+    int     st_prev_cmd = -1;
     while (true) {
+        if (stats_every > 0) {
+            const int64_t now = ggml_time_us();
+            if (st_prev_cmd >= 0) {
+                st[st_prev_cmd].us += now - st_t_wait;
+                st[st_prev_cmd].n++;
+                if (st_prev_cmd == RPC_CMD_GRAPH_COMPUTE || st_prev_cmd == RPC_CMD_GRAPH_RECOMPUTE ||
+                    st_prev_cmd == RPC_CMD_GRAPH_COMPUTE_STORE || st_prev_cmd == RPC_CMD_GRAPH_RECOMPUTE_KEY) {
+                    if (++st_graphs % stats_every == 0) {
+                        const double wall = (double) (now - st_t0);
+                        std::string line;
+                        char buf[96];
+                        for (int c = 0; c < RPC_CMD_COUNT; ++c) {
+                            if (st[c].n > 0) {
+                                snprintf(buf, sizeof(buf), " c%d:%.1f%%/%lld", c, 100.0 * st[c].us / wall, (long long) st[c].n);
+                                line += buf;
+                            }
+                        }
+                        GGML_LOG_WARN("[rpc-stats] %lld graphs in %.0f ms: idle %.1f%% |%s\n", (long long) stats_every, wall / 1000.0,
+                                      100.0 * st_idle_us / wall, line.c_str());
+                        for (auto & s : st) { s = cmd_stat(); }
+                        st_idle_us = 0;
+                        st_t0 = now;
+                    }
+                }
+            }
+            st_t_wait = now;
+        }
         if (!sock->recv_data(&cmd, 1)) {
             break;
+        }
+        if (stats_every > 0) {
+            const int64_t now = ggml_time_us();
+            st_idle_us += now - st_t_wait;
+            st_t_wait   = now;
+            st_prev_cmd = cmd < RPC_CMD_COUNT ? cmd : -1;
         }
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
@@ -3535,6 +3592,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_get_tensor_async_handle") == 0) { // PATCH(rpc-pipeline)
         return (void *)ggml_backend_rpc_get_tensor_async_handle;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_trace") == 0) { // PATCH(rpc-trace)
+        return (void *)rpc_trace;
     }
     if (std::strcmp(name, "ggml_backend_rpc_handle_wait") == 0) { // PATCH(rpc-pipeline)
         return (void *)ggml_backend_rpc_handle_wait;
