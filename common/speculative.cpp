@@ -13,6 +13,8 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2553,7 +2555,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
 struct common_speculative_init_result::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        if (model_shared) { context.reset(); (void) model.release(); }   // [multi] owned by the process-wide cache
+    }
+    bool model_shared = false;
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
     llama_model_ptr   model;
@@ -2594,7 +2599,23 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        // [multi] LLAMA_MULTI: share the draft model between the instances of this process
+        static std::mutex dft_cache_mutex;
+        static std::map<std::string, llama_model *> dft_cache;
+        static const bool dft_cache_on = [] { const char * e = getenv("LLAMA_MULTI"); return e && atoi(e) > 1; }();
+        llama_model * model_dft = nullptr;
+        if (dft_cache_on) {
+            std::lock_guard<std::mutex> lk(dft_cache_mutex);
+            auto it = dft_cache.find(params.model.path);
+            if (it != dft_cache.end()) { model_dft = it->second; pimpl->model_shared = true; }
+        }
+        if (model_dft == nullptr) {
+            model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+            if (model_dft != nullptr && dft_cache_on) {
+                std::lock_guard<std::mutex> lk(dft_cache_mutex);
+                dft_cache[params.model.path] = model_dft; pimpl->model_shared = true;
+            }
+        }
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
