@@ -547,6 +547,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             if (cur_seq_set.size() > n_ubatch) {
                 break;
             }
+
+            // PATCH(ubatch-per-seq): LLAMA_UBATCH_PER_SEQ=1 -> one sequence per ubatch (pipeline across sessions)
+            static const bool per_seq = [] { const char * e = getenv("LLAMA_UBATCH_PER_SEQ"); return e && atoi(e) != 0; }();
+            if (per_seq) {
+                break;
+            }
         }
     }
 
