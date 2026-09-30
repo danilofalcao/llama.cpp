@@ -626,6 +626,16 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             D, n_seqs, ssm_states_all->nb[1],
             ((size_t) (K - 1) * mem_size + kv_head) * row_size);
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, s, ckpt));
+    } else if (rs_long_ckpt_enabled()) {
+        // PATCH(rs-long-shape): the same two nodes (view + cpy) with zero rows, so a long pass does not change the
+        // graph's node count. Otherwise every rs-long verify batch makes the scheduler re-plan and synchronize twice
+        // (into and out of the long shape) and leaves the plan at the current small KV size (see pp-rereserve).
+        // Empty nodes launch no kernel (ggml_cuda_is_view_or_noop / ggml_is_empty) and the empty cpy does not read s,
+        // so the fused GDN paths are unchanged.
+        ggml_tensor * ckpt0 = ggml_view_2d(ctx0, ssm_states_all,
+            D, 0, ssm_states_all->nb[1],
+            ((size_t) (K - 1) * mem_size + kv_head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ckpt0, ckpt0));
     }
 
     return output;
