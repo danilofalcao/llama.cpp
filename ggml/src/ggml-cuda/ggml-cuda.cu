@@ -5819,8 +5819,19 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// PATCH(rpc-pipeline): run fn(user_data) on a host thread when the backend's stream reaches this point; later work on
+// the stream waits for it (ggml_backend_sched uses it to make the stream wait for data fetched from an RPC device)
+static void ggml_backend_cuda_enqueue_host_func(ggml_backend_t backend, void (*fn)(void *), void * user_data) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaLaunchHostFunc(cuda_ctx->stream(), fn, user_data));
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_enqueue_host_func") == 0) { // PATCH(rpc-pipeline)
+        return (void *)ggml_backend_cuda_enqueue_host_func;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

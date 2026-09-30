@@ -628,6 +628,21 @@ static bool is_valid_fd(sockfd_t sockfd) {
 #endif
 }
 
+// PATCH(rpc-pipeline): a fixed send buffer (GGML_RPC_SNDBUF_KB, default 8192; 0 = kernel autotuning). With the
+// autotuned buffer (~85 KB seen on the server) sending a 2.6 MB ubatch output blocks the rpc-server thread until the
+// last bytes are acknowledged; with room for the whole message send() returns and the server goes on.
+static void set_send_buffer(sockfd_t sockfd) {
+    static const int kb = [] {
+        const char * e = getenv("GGML_RPC_SNDBUF_KB");
+        return e != nullptr ? atoi(e) : 8192;
+    }();
+    if (kb <= 0) {
+        return;
+    }
+    int v = kb * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&v, sizeof(v));
+}
+
 static bool set_no_delay(sockfd_t sockfd) {
     int flag = 1;
     // set TCP_NODELAY to disable Nagle's algorithm
@@ -650,6 +665,7 @@ socket_ptr socket_t::accept() {
         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
         return nullptr;
     }
+    set_send_buffer(client_socket_fd); // PATCH(rpc-pipeline)
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 

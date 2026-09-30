@@ -841,7 +841,51 @@ struct ggml_backend_sched {
 
     // PATCH(pp-rereserve): number of reallocations done by ggml_backend_sched_alloc_splits
     int64_t n_realloc;
+
+    struct ggml_sched_pipe * pipe; // PATCH(rpc-pipeline), lazily created
 };
+
+// PATCH(rpc-pipeline) -------------------------------------------------------------------------------------------
+// GGML_RPC_PIPELINE=1. (a) An input of a split that was produced on an RPC device and is consumed by a backend that
+// can wait on the host (CUDA: cudaLaunchHostFunc) is fetched asynchronously into a pinned staging buffer; the
+// consumer's stream waits for it (host function) and copies it itself. The CPU does not block on the RPC output, so
+// it goes on and issues the next ubatch to the RPC server while the server is still computing this one. Only inputs
+// of at least GGML_RPC_PIPELINE_MIN_KB (default 256 KB: prompt ubatches; decode steps keep the synchronous path).
+// (b) Graph inputs copied TO an RPC device skip the synchronize: the server executes commands in order and
+// set_tensor_async copies the data into the message at once.
+typedef void * (*sched_rpc_get_handle_t)(ggml_backend_t, const struct ggml_tensor *, void *, size_t, size_t);
+typedef void   (*sched_rpc_wait_t)(void *);
+typedef void   (*sched_enqueue_host_func_t)(ggml_backend_t, void (*)(void *), void *);
+
+struct ggml_sched_pipe_slot {
+    ggml_backend_buffer_t buf  = nullptr;
+    size_t                size = 0;
+    ggml_backend_event_t  ev   = nullptr; // recorded on the consumer after its copy out of the slot
+    ggml_backend_dev_t    dev  = nullptr;
+    bool                  used = false;
+};
+
+struct ggml_sched_pipe {
+    size_t min_bytes = 256 * 1024;
+    int8_t is_rpc[GGML_SCHED_MAX_BACKENDS];        // -1 unknown
+    int8_t can_host_wait[GGML_SCHED_MAX_BACKENDS]; // -1 unknown
+    std::vector<ggml_sched_pipe_slot> slots;
+    int next = 0;
+};
+
+static bool ggml_sched_pipe_enabled() {
+    static const bool v = [] {
+        const char * e = getenv("GGML_RPC_PIPELINE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return v;
+}
+
+static void * ggml_sched_backend_proc(ggml_backend_t backend, const char * name) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1665,8 +1709,124 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// PATCH(rpc-pipeline)
+static struct ggml_sched_pipe * ggml_sched_pipe_get(ggml_backend_sched_t sched) {
+    if (!ggml_sched_pipe_enabled()) {
+        return nullptr;
+    }
+    if (sched->pipe == nullptr) {
+        sched->pipe = new ggml_sched_pipe;
+        memset(sched->pipe->is_rpc,        -1, sizeof(sched->pipe->is_rpc));
+        memset(sched->pipe->can_host_wait, -1, sizeof(sched->pipe->can_host_wait));
+        const char * e = getenv("GGML_RPC_PIPELINE_MIN_KB");
+        if (e != nullptr) {
+            sched->pipe->min_bytes = (size_t) atoll(e) * 1024;
+        }
+        const char * n = getenv("GGML_RPC_PIPELINE_SLOTS");
+        sched->pipe->slots.resize(n != nullptr ? std::max(2, atoi(n)) : 4);
+    }
+    return sched->pipe;
+}
+
+static bool ggml_sched_pipe_is_rpc(ggml_backend_sched_t sched, int backend_id) {
+    auto * p = sched->pipe;
+    if (p->is_rpc[backend_id] < 0) {
+        p->is_rpc[backend_id] = ggml_sched_backend_proc(sched->backends[backend_id], "ggml_backend_rpc_get_tensor_async_handle") != nullptr;
+    }
+    return p->is_rpc[backend_id] != 0;
+}
+
+static bool ggml_sched_pipe_can_host_wait(ggml_backend_sched_t sched, int backend_id) {
+    auto * p = sched->pipe;
+    if (p->can_host_wait[backend_id] < 0) {
+        ggml_backend_t b = sched->backends[backend_id];
+        p->can_host_wait[backend_id] = ggml_sched_backend_proc(b, "ggml_backend_cuda_enqueue_host_func") != nullptr &&
+            b->iface.set_tensor_async != nullptr && ggml_backend_get_device(b) != nullptr &&
+            ggml_backend_dev_host_buffer_type(ggml_backend_get_device(b)) != nullptr;
+    }
+    return p->can_host_wait[backend_id] != 0;
+}
+
+// fetch `input` (on the RPC backend src) into a staging slot and make dst's stream copy it into input_cpy once it
+// has arrived; returns false if not possible (the caller falls back to the synchronous copy)
+static bool ggml_sched_pipe_copy(ggml_backend_sched_t sched, ggml_backend_t src, ggml_backend_t dst,
+                                 struct ggml_tensor * input, struct ggml_tensor * input_cpy) {
+    auto * p = sched->pipe;
+    static sched_rpc_get_handle_t    get = nullptr;
+    static sched_rpc_wait_t          wait = nullptr;
+    static sched_enqueue_host_func_t enq = nullptr;
+    if (get == nullptr) {
+        get  = (sched_rpc_get_handle_t)    ggml_sched_backend_proc(src, "ggml_backend_rpc_get_tensor_async_handle");
+        wait = (sched_rpc_wait_t)          ggml_sched_backend_proc(src, "ggml_backend_rpc_handle_wait");
+    }
+    if (enq == nullptr) {
+        enq  = (sched_enqueue_host_func_t) ggml_sched_backend_proc(dst, "ggml_backend_cuda_enqueue_host_func");
+    }
+    if (get == nullptr || wait == nullptr || enq == nullptr) {
+        return false;
+    }
+    const size_t n = ggml_nbytes(input);
+    ggml_backend_dev_t dev = ggml_backend_get_device(dst);
+
+    ggml_sched_pipe_slot & s = p->slots[p->next];
+    if (s.used && s.ev != nullptr) {
+        ggml_backend_event_synchronize(s.ev); // the copy out of this slot (a few ubatches ago) is done
+    }
+    if (s.buf == nullptr || s.dev != dev || s.size < n) {
+        if (s.buf != nullptr) {
+            ggml_backend_buffer_free(s.buf);
+            s.buf = nullptr;
+        }
+        if (s.ev != nullptr) {
+            ggml_backend_event_free(s.ev);
+            s.ev = nullptr;
+        }
+        s.used = false;
+        const size_t size = std::max(n, (size_t) 8 * 1024 * 1024);
+        s.buf = ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(dev), size);
+        s.ev  = ggml_backend_event_new(dev);
+        if (s.buf == nullptr || s.ev == nullptr) {
+            return false;
+        }
+        s.size = size;
+        s.dev  = dev;
+    }
+    void * stage = ggml_backend_buffer_get_base(s.buf);
+    void * h = get(src, input, stage, 0, n);
+    if (h == nullptr) {
+        return false;
+    }
+    p->next = (p->next + 1) % (int) p->slots.size();
+    enq(dst, wait, h);                                          // dst's stream waits until the data is in `stage`
+    ggml_backend_tensor_set_async(dst, input_cpy, stage, 0, n); // then copies it (stream-ordered after dst's work)
+    ggml_backend_event_record(s.ev, dst);
+    s.used = true;
+    return true;
+}
+
+static void ggml_sched_pipe_free(ggml_backend_sched_t sched) {
+    auto * p = sched->pipe;
+    if (p == nullptr) {
+        return;
+    }
+    for (auto & s : p->slots) {
+        if (s.used && s.ev != nullptr) {
+            ggml_backend_event_synchronize(s.ev);
+        }
+        if (s.buf != nullptr) {
+            ggml_backend_buffer_free(s.buf);
+        }
+        if (s.ev != nullptr) {
+            ggml_backend_event_free(s.ev);
+        }
+    }
+    delete p;
+    sched->pipe = nullptr;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    struct ggml_sched_pipe * pipe = ggml_sched_pipe_get(sched); // PATCH(rpc-pipeline)
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -1697,6 +1857,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                // PATCH(rpc-pipeline): to an RPC device, no synchronize: the data is copied into the message at once
+                if (pipe != nullptr && ggml_backend_buffer_is_host(input->buffer) && ggml_sched_pipe_is_rpc(sched, split_backend_id)) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    continue;
+                }
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1705,6 +1870,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // PATCH(rpc-pipeline): output of an RPC device -> asynchronous, stream-ordered copy (no CPU wait)
+                if (pipe != nullptr && ggml_nbytes(input) >= pipe->min_bytes && input_backend != split_backend &&
+                    ggml_sched_pipe_is_rpc(sched, ggml_backend_sched_backend_id(sched, input_backend)) &&
+                    ggml_sched_pipe_can_host_wait(sched, split_backend_id) &&
+                    ggml_sched_pipe_copy(sched, input_backend, split_backend, input, input_cpy)) {
+                    continue;
+                }
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -1955,6 +2127,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    ggml_sched_pipe_free(sched); // PATCH(rpc-pipeline)
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);

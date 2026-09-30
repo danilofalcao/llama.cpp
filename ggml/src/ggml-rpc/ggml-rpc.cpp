@@ -451,6 +451,8 @@ public:
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    // PATCH(rpc-pipeline): async command with a response; the future completes once the response is in `output`
+    std::shared_future<void> send_async_future(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -460,6 +462,7 @@ public:
 
     void start(const std::string & endpoint);
     void work();
+    void read_work(); // PATCH(rpc-pipeline)
 
     ~rpc_dispatcher();
 
@@ -494,6 +497,13 @@ private:
     socket_ptr       sock;
     std::atomic_bool running;
     std::thread      thread;
+    // PATCH(rpc-pipeline): GGML_RPC_PIPELINE=1 -> the writer thread (work) sends every queued command without waiting
+    // for responses; this reader thread receives the responses in order and completes the messages in order
+    // (commands without a response complete when every earlier one has). Commands of the next ubatch reach the
+    // server while it is still computing the current one.
+    bool             pipelined = false;
+    rpc_msg_queue    rqueue;
+    std::thread      rthread;
 };
 
 static void rpc_dispatcher_trampoline(rpc_dispatcher * dispatcher)
@@ -543,6 +553,18 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
     msg->output = output;
     msg->output_size = output_size;
     GGML_ASSERT(queue.push(msg));
+}
+
+std::shared_future<void> rpc_dispatcher::send_async_future(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    auto msg = std::make_shared<rpc_msg>();
+    msg->cmd = cmd;
+    msg->input = input;
+    msg->input_size = input_size;
+    msg->output = output;
+    msg->output_size = output_size;
+    std::shared_future<void> f = msg->completion.get_future().share();
+    GGML_ASSERT(queue.push(msg));
+    return f;
 }
 
 ggml_backend_event_t rpc_dispatcher::event_new(ggml_backend_dev_t dev) {
@@ -602,6 +624,13 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
     running = true;
+    {
+        const char * e = std::getenv("GGML_RPC_PIPELINE"); // PATCH(rpc-pipeline)
+        pipelined = e != nullptr && std::atoi(e) != 0;
+    }
+    if (pipelined) {
+        rthread = std::thread([this] { read_work(); });
+    }
     thread = std::thread(rpc_dispatcher_trampoline, this);
 }
 
@@ -610,6 +639,16 @@ void rpc_dispatcher::work() {
         rpc_msg_ptr msg_ptr;
         if (!queue.pop(&msg_ptr)) {
             break;
+        }
+        if (pipelined) { // PATCH(rpc-pipeline): send only; the reader completes the message in order
+            if (msg_ptr->cmd != RPC_CMD_NONE) {
+                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
+                RPC_STATUS_ASSERT(status);
+            }
+            if (!rqueue.push(msg_ptr)) {
+                break;
+            }
+            continue;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
             if (msg_ptr->output) {
@@ -624,13 +663,37 @@ void rpc_dispatcher::work() {
     }
 }
 
+// PATCH(rpc-pipeline): responses arrive in command order
+void rpc_dispatcher::read_work() {
+    while (true) {
+        rpc_msg_ptr msg_ptr;
+        if (!rqueue.pop(&msg_ptr)) {
+            break;
+        }
+        if (msg_ptr->cmd != RPC_CMD_NONE && msg_ptr->output) {
+            uint64_t out_size = 0;
+            bool status = sock->recv_data(&out_size, sizeof(out_size)) && out_size == msg_ptr->output_size &&
+                          sock->recv_data(msg_ptr->output, msg_ptr->output_size);
+            if (!status && !running) {
+                break;
+            }
+            RPC_STATUS_ASSERT(status);
+        }
+        msg_ptr->completion.set_value();
+    }
+}
+
 rpc_dispatcher::~rpc_dispatcher() {
     running = false;
     queue.interrupt();
-    sock = nullptr;
     if (thread.joinable()) {
         thread.join();
     }
+    rqueue.interrupt(); // PATCH(rpc-pipeline)
+    if (rthread.joinable()) {
+        rthread.join();
+    }
+    sock = nullptr;
 }
 
 static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
@@ -1411,6 +1474,26 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
     request->offset = offset;
     request->size = size;
     ctx->dispatcher->send_async(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+}
+
+// PATCH(rpc-pipeline): GET_TENSOR queued behind the commands already issued; returns a handle that
+// ggml_backend_rpc_handle_wait() blocks on (and frees) - called from another backend's stream (host function)
+static void * ggml_backend_rpc_get_tensor_async_handle(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
+    if (rpc_use_state_ref(tensor, size, true)) {
+        return nullptr;
+    }
+    auto request = std::make_shared<rpc_msg_get_tensor_req>();
+    request->tensor = serialize_tensor(tensor);
+    request->offset = offset;
+    request->size = size;
+    return new std::shared_future<void>(ctx->dispatcher->send_async_future(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size));
+}
+
+static void ggml_backend_rpc_handle_wait(void * handle) {
+    auto * f = (std::shared_future<void> *) handle;
+    f->wait();
+    delete f;
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
@@ -3449,6 +3532,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_state_ref_recurrent") == 0) { // PATCH(ckpt-rpc-ref)
         return (void *)ggml_backend_rpc_state_ref_recurrent;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_get_tensor_async_handle") == 0) { // PATCH(rpc-pipeline)
+        return (void *)ggml_backend_rpc_get_tensor_async_handle;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_handle_wait") == 0) { // PATCH(rpc-pipeline)
+        return (void *)ggml_backend_rpc_handle_wait;
     }
     return NULL;
 
