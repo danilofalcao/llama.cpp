@@ -86,6 +86,7 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_COMPUTE_STORE,  // PATCH(rpc-graph-cache)
     RPC_CMD_GRAPH_RECOMPUTE_KEY,  // PATCH(rpc-graph-cache)
     RPC_CMD_SET_TENSOR_HASH_RANGE, // PATCH(state-ref-split)
+    RPC_CMD_GET_TENSOR_REF_KV,     // PATCH(prompt-rpc-ref): like GET_TENSOR_REF, stored in the KV (conversation) store
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -839,10 +840,14 @@ static std::atomic<int> rpc_state_ref_misses{0};
 // PATCH(ckpt-rpc-ref): while the client has this set (context-checkpoint creation only), recurrent
 // state regions (cache_r_l*/cache_s_l*) are saved by reference too, so a checkpoint no longer pulls
 // the remote layers' recurrent state over the network. Markers are recognised on restore regardless.
-static std::atomic<bool> rpc_state_ref_recurrent{false};
+// PATCH(prompt-rpc-ref): 0 = off, 1 = context checkpoint (server state cache), 2 = prompt-cache / slot-swap
+// save: the recurrent regions go to the server's KV (conversation) store, next to the KV regions of the same
+// save, so both are kept and evicted together (the state cache churns with every checkpoint).
+// per thread: with LLAMA_MULTI two server instances save states from different threads
+static thread_local int rpc_state_ref_recurrent = 0;
 
 static void ggml_backend_rpc_state_ref_recurrent(int on) {
-    rpc_state_ref_recurrent.store(on != 0);
+    rpc_state_ref_recurrent = on;
 }
 
 static bool rpc_use_state_ref(const ggml_tensor * tensor, size_t size, bool save) {
@@ -856,7 +861,7 @@ static bool rpc_use_state_ref(const ggml_tensor * tensor, size_t size, bool save
     if (strncmp(tensor->name, "cache_k_l", 9) == 0 || strncmp(tensor->name, "cache_v_l", 9) == 0) {
         return true;
     }
-    return rpc_is_state_name(tensor->name) && (!save || rpc_state_ref_recurrent.load());
+    return rpc_is_state_name(tensor->name) && (!save || rpc_state_ref_recurrent != 0);
 }
 
 static bool rpc_state_ref_parse(const void * data, size_t size, rpc_state_ref_marker & m) {
@@ -1031,7 +1036,9 @@ static bool rpc_state_ref_save(D * dispatcher, const ggml_tensor * tensor, void 
     request->offset = offset;
     request->size   = size;
     rpc_msg_get_tensor_ref_rsp response;
-    dispatcher->send(RPC_CMD_GET_TENSOR_REF, request, sizeof(*request), &response, sizeof(response));
+    // PATCH(prompt-rpc-ref): recurrent state saved with a conversation goes to the KV (conversation) store
+    const bool to_kv = rpc_is_state_name(tensor->name) && rpc_state_ref_recurrent == 2;
+    dispatcher->send(to_kv ? RPC_CMD_GET_TENSOR_REF_KV : RPC_CMD_GET_TENSOR_REF, request, sizeof(*request), &response, sizeof(response));
     if (!response.result) {
         return false; // server has no room: fall back to a real GET_TENSOR
     }
@@ -1672,7 +1679,7 @@ public:
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool set_tensor_hash_range(const rpc_msg_set_tensor_hash_range_req & request, rpc_msg_set_tensor_hash_rsp & response); // PATCH(state-ref-split)
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
-    bool get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response); // PATCH(rpc-state-ref)
+    bool get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response, bool force_kv = false); // PATCH(rpc-state-ref), PATCH(prompt-rpc-ref)
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
@@ -2525,11 +2532,11 @@ bool rpc_server::kv_read(uint64_t hash, uint64_t src_off, uint64_t len, uint8_t 
 }
 
 // PATCH(rpc-state-ref): read a KV region into the state cache and return only its hash
-bool rpc_server::get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response) {
+bool rpc_server::get_tensor_ref(const rpc_msg_get_tensor_req & request, rpc_msg_get_tensor_ref_rsp & response, bool force_kv) {
     response.hash   = 0;
     response.result = 0;
-    const bool kv_region = kv_budget > 0 && request.size <= kv_budget &&
-        (strncmp(request.tensor.name, "cache_k_l", 9) == 0 || strncmp(request.tensor.name, "cache_v_l", 9) == 0); // PATCH(state-dedup)
+    const bool kv_region = kv_budget > 0 && request.size <= kv_budget && (force_kv || // PATCH(prompt-rpc-ref)
+        strncmp(request.tensor.name, "cache_k_l", 9) == 0 || strncmp(request.tensor.name, "cache_v_l", 9) == 0); // PATCH(state-dedup)
     if (!kv_region && (state_cache_budget == 0 || request.size < RPC_STATE_MIN_SIZE || request.size > state_cache_budget)) {
         return true;
     }
@@ -3070,13 +3077,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
-            case RPC_CMD_GET_TENSOR_REF: { // PATCH(rpc-state-ref)
+            case RPC_CMD_GET_TENSOR_REF:      // PATCH(rpc-state-ref)
+            case RPC_CMD_GET_TENSOR_REF_KV: { // PATCH(prompt-rpc-ref)
                 rpc_msg_get_tensor_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_get_tensor_ref_rsp response;
-                if (!server.get_tensor_ref(request, response)) {
+                if (!server.get_tensor_ref(request, response, cmd == RPC_CMD_GET_TENSOR_REF_KV)) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {

@@ -30,6 +30,8 @@
 #include <map>
 #include <fstream>
 
+static void prompt_rpc_ref(bool on); // PATCH(prompt-rpc-ref)
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -325,7 +327,9 @@ struct server_slot {
             return false;
         }
 
+        prompt_rpc_ref(true);  // PATCH(prompt-rpc-ref)
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        prompt_rpc_ref(false); // PATCH(prompt-rpc-ref)
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
@@ -907,6 +911,27 @@ static void ckpt_rpc_ref(bool on) {
     }();
     if (fn) {
         fn(on ? 1 : 0);
+    }
+}
+
+// PATCH(prompt-rpc-ref): LLAMA_PROMPT_RPC_REF=1 -> a prompt-cache save (--cache-ram, slot-swap) keeps the recurrent
+// state of the RPC layers on the RPC server by reference, in its KV (conversation) store next to the KV of the same
+// save, instead of pulling it over the network before the next request starts (~100 MB, 0.45-2 s per switch).
+// A later miss (evicted / restarted server) fails the load and the prompt is re-processed, as for the KV regions.
+static void prompt_rpc_ref(bool on) {
+    static void (*fn)(int) = [] {
+        const char * e = std::getenv("LLAMA_PROMPT_RPC_REF");
+        const bool enabled = e != nullptr && std::atoi(e) != 0;
+        void (*f)(int) = nullptr;
+        if (enabled) {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
+            f = reg ? (void (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_state_ref_recurrent") : nullptr;
+        }
+        fprintf(stderr, "prompt-rpc-ref: %s\n", f ? "on" : "off");
+        return f;
+    }();
+    if (fn) {
+        fn(on ? 2 : 0);
     }
 }
 
