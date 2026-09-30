@@ -593,7 +593,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
 static int llama_server_multi(common_params & params, int argc, char ** argv, int n_inst) {
     const int base_port = params.port;
-    struct inst_t { int port; std::atomic<int> busy{0}; std::thread th; int rc = 0; };
+    struct inst_t { int port; int cap = 1; std::atomic<int> busy{0}; std::thread th; int rc = 0; };
     std::vector<std::unique_ptr<inst_t>> insts;
 
     auto wait_ready = [&](int port, int timeout_s) {
@@ -612,13 +612,14 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
         inst->port = base_port + 1 + i;
         common_params p = params;
         p.port = inst->port;
+        inst->cap = std::max(1, p.n_parallel);
         if (i > 0) {   // extra instances: smaller context / fewer slots (LLAMA_MULTI_CTX, LLAMA_MULTI_NP)
             static const int mctx = [] { const char * e = getenv("LLAMA_MULTI_CTX"); return e ? atoi(e) : 0; }();
             static const int mnp  = [] { const char * e = getenv("LLAMA_MULTI_NP");  return e ? atoi(e) : 0; }();
             static const int mnmax = [] { const char * e = getenv("LLAMA_MULTI_DRAFT_NMAX"); return e ? atoi(e) : 0; }();
             static const int mub   = [] { const char * e = getenv("LLAMA_MULTI_UB"); return e ? atoi(e) : 0; }();
             if (mctx > 0) { p.n_ctx = mctx; if (p.kv_unified_per_slot > mctx) { p.kv_unified_per_slot = mctx; } }
-            if (mnp  > 0) { p.n_parallel = mnp; }
+            if (mnp  > 0) { p.n_parallel = mnp; inst->cap = mnp; }
             if (mnmax > 0 && p.speculative.draft.n_max > mnmax) { p.speculative.draft.n_max = mnmax; }
             if (mub > 0 && p.n_ubatch > mub) { p.n_ubatch = mub; if (p.n_batch > mub * 4) { p.n_batch = mub * 4; } }
         }
@@ -645,10 +646,16 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
         SRV_ERR("%s", "[multi] failed to initialize the proxy HTTP server\n");
         return 1;
     }
+    // first instance with a free slot (the first instance has the big context and the warm cache); if all are full,
+    // the least loaded relative to its capacity
     auto pick = [&]() -> inst_t * {
-        inst_t * best = nullptr;
         for (auto & in : insts) {
-            if (!best || in->busy.load() < best->busy.load()) { best = in.get(); }
+            if (in->busy.load() < in->cap) { return in.get(); }
+        }
+        inst_t * best = nullptr; double best_load = 1e9;
+        for (auto & in : insts) {
+            const double load = (double) in->busy.load() / in->cap;
+            if (load < best_load) { best_load = load; best = in.get(); }
         }
         return best;
     };
