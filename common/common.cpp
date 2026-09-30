@@ -1301,7 +1301,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    // [multi] a cached model needs no fitting pass (it would try to create a full context and may OOM)
+    bool model_cached = false;
+    {
+        static std::mutex m; static const bool on = [] { const char * e = getenv("LLAMA_MULTI"); return e && atoi(e) > 1; }();
+        (void) m; if (on) { model_cached = true; }
+    }
+    if (params.fit_params && !model_cached) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 

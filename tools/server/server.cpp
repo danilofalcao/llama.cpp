@@ -612,6 +612,12 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
         inst->port = base_port + 1 + i;
         common_params p = params;
         p.port = inst->port;
+        if (i > 0) {   // extra instances: smaller context / fewer slots (LLAMA_MULTI_CTX, LLAMA_MULTI_NP)
+            static const int mctx = [] { const char * e = getenv("LLAMA_MULTI_CTX"); return e ? atoi(e) : 0; }();
+            static const int mnp  = [] { const char * e = getenv("LLAMA_MULTI_NP");  return e ? atoi(e) : 0; }();
+            if (mctx > 0) { p.n_ctx = mctx; if (p.kv_unified_per_slot > mctx) { p.kv_unified_per_slot = mctx; } }
+            if (mnp  > 0) { p.n_parallel = mnp; }
+        }
         inst_t * ip = inst.get();
         inst->th = std::thread([ip, p, argc, argv]() mutable {
             ip->rc = llama_server(p, argc, argv);
