@@ -577,6 +577,40 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
+
+    // [rs-ring] no snapshots: the op writes ONE state (before the ring-held tail of this pass) and the ring
+    if (inp->ring_ctl != nullptr) {
+        ggml_tensor * gdn_out = ggml_gated_delta_net_ring(ctx0, q, k, v, g, b, s,
+                mctx_cur->get_ring_l(il), inp->ring_ctl, mctx_cur->get_ring_R());
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+        const int64_t attn_score_elems = S_v * H_v * n_seq_tokens * n_seqs;
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
+            D, n_seqs, 1,
+            ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, D * n_seqs),
+            ggml_row_size(gdn_out->type, attn_score_elems));
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
+            D, n_seqs, 1,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        return output;
+    }
+
     const int64_t K = cparams.n_rs_seq + 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.

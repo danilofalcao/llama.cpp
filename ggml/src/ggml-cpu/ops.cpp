@@ -10938,11 +10938,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    const bool ring_mode = ggml_get_op_params_i32(dst, 1) > 0; // PATCH(rs-ring)
+    const int64_t per_thread = S_v + (K > 1 || ring_mode ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = K > 1 || ring_mode ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -10964,6 +10965,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    // PATCH(rs-ring): see ggml_gated_delta_net_ring
+    const int64_t R = ggml_get_op_params_i32(dst, 1);
+    const ggml_tensor * src_ring = R > 0 ? dst->src[6] : nullptr;
+    const ggml_tensor * src_ctl  = R > 0 ? dst->src[7] : nullptr;
+    const int64_t H_k = R > 0 ? ggml_get_op_params_i32(dst, 2) : nek1;
+    const int64_t TS  = S_v*H_k + H + S_v*H;
+    GGML_ASSERT(R == 0 || (K == 1 && !kda));
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
@@ -10976,7 +10985,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
         // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = (K > 1)
+        float * s_out = (K > 1 || ring_mode)
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
@@ -10984,6 +10993,27 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+
+        int64_t ring_b = 0; // tokens folded into the state output; the last min(n_tokens, R) go to the ring
+        float * ring_w = nullptr;
+        if (R > 0) {
+            const int32_t * c        = (const int32_t *) src_ctl->data + 3*iv3;
+            const float *   ring_r   = (const float *) ((const char *) src_ring->data + (int64_t) c[1]*src_ring->nb[1]);
+            ring_w = (float *) ((char *) src_ring->data + (int64_t) c[2]*src_ring->nb[1]);
+            for (int64_t j = 0; j < c[0]; ++j) {
+                const float * rj = ring_r + j*TS;
+                // same two steps as the token loop: decay, then rank-1 update with the stored delta
+                ggml_vec_scale_f32(S_v * S_v, s_out, rj[S_v*H_k + iv1]);
+                for (int64_t jj = 0; jj < S_v; ++jj) {
+                    ggml_vec_mad_f32(S_v, &s_out[jj * S_v], rj + (ik1 % H_k)*S_v, rj[S_v*H_k + H + iv1*S_v + jj]);
+                }
+            }
+            ring_b = n_tokens > R ? n_tokens - R : 0;
+            if (ring_b == 0) {
+                // the cache keeps the state before this pass; the ring keeps this pass
+                memcpy(state_out_base + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
+            }
+        }
 
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
@@ -11011,12 +11041,22 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             } else {
                 ggml_vec_scale_f32(S_v * S_v, s_out, expf(g_d[0]));
             }
+            if (ring_mode && t >= ring_b) {
+                float * rt = ring_w + (t - ring_b)*TS;
+                rt[S_v*H_k + iv1] = expf(g_d[0]);
+                if (iv1 < H_k) {
+                    memcpy(rt + iv1*S_v, k_d, S_v*sizeof(float));
+                }
+            }
 
             // delta[j] = sum_i S[i][j] * k[i] = dot(row j of M, k)
             for (int64_t j = 0; j < S_v; ++j) {
                 float sum = 0.0f;
                 ggml_vec_dot_f32(S_v, &sum, 0, &s_out[j * S_v], 0, k_d, 0, 1);
                 delta[j] = (v_d[j] - sum) * beta_val;
+            }
+            if (ring_mode && t >= ring_b) {
+                memcpy(ring_w + (t - ring_b)*TS + S_v*H_k + H + iv1*S_v, delta, S_v*sizeof(float));
             }
 
             // outer product: S[i][j] += k[i] * delta[j] => M[j][i] += delta[j] * k[i]
@@ -11033,6 +11073,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             attn_data += S_v * H; // advance to next token
 
+            if (ring_mode && t + 1 == ring_b) {
+                memcpy(state_out_base + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));
+            }
+
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
@@ -11042,6 +11086,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                 }
             }
         }
+
     }
 }
 

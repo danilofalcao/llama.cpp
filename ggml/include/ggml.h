@@ -2659,6 +2659,30 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // PATCH(rs-ring): snapshot-free speculative rollback for the gated delta rule (cf. ReplaySSM / TreeWY).
+    // Instead of K full state snapshots, a pass stores per token the pseudo-value d_t (= delta), the key
+    // k_t and the decay exp(g_t) in a small ring; the next pass first folds the accepted ring tokens
+    // into the committed state (S = exp(g_j) S + k_j d_j^T, the same arithmetic as the pass itself, so
+    // the folded state is bit-identical to the snapshot it replaces).
+    //   ring : F32 [R * TS, n_rows] persistent per-layer tensor, TS = S_v*H_k + H_v + S_v*H_v floats per
+    //          token: [k (H_k heads) | exp(g) (H_v) | d (H_v heads)]; the op WRITES the rows given by ctl
+    //   ctl  : I32 [3, n_seqs] = { n_commit, ring row to fold from, ring row to store this pass into }
+    //   R    : ring capacity in tokens. The op outputs the state after the first b = max(0, n_tokens - R)
+    //          tokens of this pass (b == 0: the folded state from before the pass) and stores the last
+    //          n_tokens - b tokens in the ring row ctl[2], so any rollback of up to n_tokens - b works.
+    // output layout as ggml_gated_delta_net with K == 1. Scalar gate only (no KDA).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ring(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * ring,
+            struct ggml_tensor  * ctl,
+            int64_t               R);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

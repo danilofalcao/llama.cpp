@@ -340,6 +340,24 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    // [rs-ring]
+    if (s_copy_ring) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_ring->buffer));
+        int32_t * data = (int32_t *) s_copy_ring->data;
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->s_copy_ring(i);
+        }
+    }
+    if (ring_ctl) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(ring_ctl->buffer));
+        GGML_ASSERT(ubatch != nullptr);
+        int32_t * data = (int32_t *) ring_ctl->data;
+        const int64_t n_seqs = ring_ctl->ne[0] / 3;
+        for (int64_t i = 0; i < n_seqs; ++i) {
+            mctx->ring_ctl((int) i, ubatch->n_seq_tokens, data + 3*i);
+        }
+    }
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -353,6 +371,12 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= (ring_ctl != nullptr) == mctx->is_ring();
+    if (ring_ctl) {
+        res &= ring_ctl->ne[0] == 3*(int64_t) params.ubatch.n_seqs;
+        res &= s_copy_ring->ne[0] == mctx->get_n_rs();
+    }
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
@@ -3539,6 +3563,19 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
 
+    // [rs-ring]
+    if (mctx_cur->is_ring()) {
+        inp->s_copy_ring = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_ring);
+        ggml_set_name(inp->s_copy_ring, "rs_s_copy_ring");
+        inp->s_copy_ring_main  = ggml_view_1d(ctx0, inp->s_copy_ring, n_seqs, 0);
+        inp->s_copy_ring_extra = ggml_view_1d(ctx0, inp->s_copy_ring, n_rs - n_seqs, n_seqs * inp->s_copy_ring->nb[0]);
+
+        inp->ring_ctl = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 3*n_seqs);
+        ggml_set_input(inp->ring_ctl);
+        ggml_set_name(inp->ring_ctl, "rs_ring_ctl");
+    }
+
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
@@ -3564,6 +3601,19 @@ ggml_tensor * llm_graph_context::build_rs(
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+}
+
+ggml_tensor * llm_graph_context::build_rs_ssm(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    if (inp->s_copy_ring == nullptr) {
+        return build_rs(inp, s, state_size, n_seqs);
+    }
+    const auto * kv_state = inp->mctx;
+    return build_rs(s, inp->s_copy_ring_main, inp->s_copy_ring_extra, state_size, n_seqs,
+                    kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z());
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

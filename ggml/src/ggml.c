@@ -6418,6 +6418,46 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// PATCH(rs-ring)
+struct ggml_tensor * ggml_gated_delta_net_ring(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * ring,
+        struct ggml_tensor  * ctl,
+        int64_t               R) {
+    GGML_ASSERT(R >= 1);
+    GGML_ASSERT(g->ne[0] == 1); // scalar gate only
+    GGML_ASSERT(ring->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(ring));
+    GGML_ASSERT(ctl->type == GGML_TYPE_I32 && ggml_is_contiguous(ctl));
+
+    const int64_t S_v    = v->ne[0];
+    const int64_t H_v    = v->ne[1];
+    const int64_t n_seqs = v->ne[3];
+    // k-heads kept in the ring, from the ring row size (k may arrive repeated to H_v heads, tiled)
+    GGML_ASSERT(ring->ne[0] % R == 0);
+    const int64_t H_k    = (ring->ne[0]/R - H_v - S_v*H_v) / S_v;
+    const int64_t TS     = S_v*H_k + H_v + S_v*H_v;
+
+    GGML_ASSERT(k->ne[0] == S_v);
+    GGML_ASSERT(H_k > 0 && ring->ne[0] == R*TS && k->ne[1] % H_k == 0);
+    GGML_ASSERT(ggml_nelements(ctl) == 3*n_seqs);
+
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+    ggml_set_op_params_i32(result, 1, (int32_t) R);
+    ggml_set_op_params_i32(result, 2, (int32_t) H_k);
+
+    result->src[6] = ring;
+    result->src[7] = ctl;
+
+    return result;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(

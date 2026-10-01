@@ -4733,6 +4733,69 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// PATCH(rs-ring): GGML_OP_GATED_DELTA_NET in ring mode (fold n_commit stored tokens, then the pass)
+struct test_gated_delta_net_ring : public test_case {
+    const int64_t H_k;
+    const int64_t head_size;
+    const int64_t v_repeat;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t R;
+    const int     n_commit;
+
+    std::string vars() override {
+        return VARS_TO_STR7(H_k, head_size, v_repeat, n_seq_tokens, n_seqs, R, n_commit);
+    }
+
+    test_gated_delta_net_ring(int64_t H_k = 4, int64_t head_size = 32, int64_t v_repeat = 1, int64_t n_seq_tokens = 3,
+            int64_t n_seqs = 1, int64_t R = 4, int n_commit = 2)
+        : H_k(H_k), head_size(head_size), v_repeat(v_repeat), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), R(R), n_commit(n_commit) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size, H_v = H_k*v_repeat;
+        const int64_t TS = S*H_k + H_v + S*H_v;
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H_v, n_seqs);
+        ggml_tensor * ring  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, R*TS, 2*n_seqs);
+        ggml_tensor * ctl   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3*n_seqs);
+        ggml_set_name(q, "q"); ggml_set_name(k, "k"); ggml_set_name(v, "v");
+        ggml_set_name(g, "g"); ggml_set_name(beta, "beta"); ggml_set_name(state, "state");
+        ggml_set_name(ring, "ring"); ggml_set_name(ctl, "ctl");
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        return ggml_gated_delta_net_ring(ctx, q, k, v, g, beta, state, ring, ctl, R);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "ring") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.2f); // exp(g) in (0, 0.2), small k and d
+            } else if (strcmp(t->name, "ctl") == 0) {
+                std::vector<int32_t> c(3*n_seqs);
+                for (int64_t s = 0; s < n_seqs; ++s) {
+                    c[3*s + 0] = n_commit;
+                    c[3*s + 1] = (int32_t) (2*s);
+                    c[3*s + 2] = (int32_t) (2*s + 1);
+                }
+                ggml_backend_tensor_set(t, c.data(), 0, c.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
@@ -11015,6 +11078,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    // PATCH(rs-ring): Qwen3.8-27B shapes (16 k-heads, 48 v-heads, 128) and small ones
+    for (int nc : {0, 1, 3, 7}) {
+        test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 7, 1, 7, nc));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 1, 1, 7, 4));
+    test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 12, 1, 7, 5));  // longer than the ring: direct
+    test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 40, 1, 40, 40));
+    test_cases.emplace_back(new test_gated_delta_net_ring(4, 64, 2, 5, 2, 6, 6));
+    test_cases.emplace_back(new test_gated_delta_net_ring(4, 32, 1, 3, 3, 4, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));

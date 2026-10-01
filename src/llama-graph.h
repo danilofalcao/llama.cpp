@@ -275,6 +275,12 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // [rs-ring] gather indices for the one-group ssm state, and the ring control {n_commit, row_r, row_w} per seq
+    ggml_tensor * s_copy_ring       = nullptr; // I32 [n_rs]
+    ggml_tensor * s_copy_ring_main  = nullptr; // I32 [n_seqs]
+    ggml_tensor * s_copy_ring_extra = nullptr; // I32 [n_rs - n_seqs]
+    ggml_tensor * ring_ctl          = nullptr; // I32 [3*n_seqs]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -1333,6 +1339,13 @@ struct llm_graph_context {
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     llm_graph_input_rs * build_rs_inp() const;
+
+    // [rs-ring] like build_rs for the gated-delta-net state tensor (one group per cell in ring mode)
+    ggml_tensor * build_rs_ssm(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,

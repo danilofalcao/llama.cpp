@@ -24,6 +24,10 @@ static bool rs_long_ckpt_enabled() {
     static const bool v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT"); return e && atoi(e) != 0; }();
     return v;
 }
+static bool rs_ring_enabled() {
+    static const bool v = [] { const char * e = getenv("LLAMA_RS_RING"); return e && atoi(e) != 0; }();
+    return v;
+}
 static long rs_long_ckpt_max_t() {
     static const long v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT_MAX_T"); const long n = e ? atol(e) : 64; return n > 0 ? n : 64; }();
     return v;
@@ -48,6 +52,30 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_idx.assign(n_seq_max, 0);
     rs_last_T.assign(n_seq_max, 0);
 
+    // [rs-ring] gated-delta-net models only (state = S x S per v-head), one sequence per memory
+    {
+        const uint32_t S   = hparams.ssm_d_state;
+        const uint32_t H_v = hparams.ssm_dt_rank;
+        const uint32_t H_k = hparams.ssm_n_group;
+        const bool shape_ok = model.arch == LLM_ARCH_QWEN35 && S > 0 && H_v > 0 && H_k > 0 &&
+            hparams.n_embd_s() == (uint32_t) S*S*H_v;
+        if (rs_ring_enabled() && n_rs_seq > 0) {
+            if (shape_ok && n_seq_max == 1) {
+                ring    = true;
+                ring_R  = n_rs_seq + 1;
+                if (rs_long_ckpt_enabled()) {
+                    ring_R = std::max<uint32_t>(ring_R, (uint32_t) rs_long_ckpt_max_t());
+                }
+                ring_TS = (int64_t) S*H_k + H_v + (int64_t) S*H_v;
+                ring_len.assign(mem_size, 0);
+                ring_par.assign(mem_size, 0);
+                rs_rb.assign(n_seq_max, 0);
+            } else {
+                LLAMA_LOG_WARN("%s: LLAMA_RS_RING ignored (needs qwen35 and one sequence per context; n_seq_max = %u)\n", __func__, n_seq_max);
+            }
+        }
+    }
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -65,7 +93,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(4u*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -86,6 +114,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    ring_l.assign(n_layer, nullptr);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -113,11 +142,18 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        // [rs-ring] one state per cell instead of (1 + n_rs_seq)
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), ring ? mem_size : n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+        if (ring) {
+            GGML_ASSERT(type_s == GGML_TYPE_F32);
+            ggml_tensor * rg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) ring_R*ring_TS, 2*mem_size);
+            ggml_format_name(rg, "cache_s_l%d_ring", i); // prefix cache_s_l: RPC saves it by reference too
+            ring_l[i] = rg;
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -142,6 +178,12 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
         const size_t memory_size_p = size_p_bytes();
+        if (ring) {
+            size_t ring_bytes = 0;
+            for (auto * t : ring_l) { if (t) { ring_bytes += ggml_nbytes(t); } }
+            LLAMA_LOG_WARN("%s: rs-ring: ring of %u tokens (%.2f MiB) instead of %u state snapshots per layer\n",
+                    __func__, ring_R, ring_bytes / (1024.0f * 1024.0f), n_rs_seq);
+        }
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
@@ -169,6 +211,8 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(rs_rb.begin(), rs_rb.end(), 0);
+    std::fill(ring_len.begin(), ring_len.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -208,6 +252,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
+                // [rs-ring] the ring must hold the tokens to drop
+                if (ring && (rollback < 1 || rollback > (llama_pos) ring_len[tail_id])) {
+                    return false;
+                }
                 // [rs-long-ckpt] after a long pass: snapshots cover rollback 1..n_rs_seq-1, group n_rs_seq = pre-pass
                 const uint32_t T_last = (size_t) seq_id < rs_last_T.size() ? rs_last_T[seq_id] : 0;
                 if (!pending && rs_long_ckpt_enabled() && n_rs_seq > 0 && T_last > n_rs_seq + 1 && T_last <= (uint32_t) rs_long_ckpt_max_t()) {
@@ -219,6 +267,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     }
                     if (idx != 0) {
                         set_rs_idx(seq_id, idx);
+                        if (ring) { rs_rb[seq_id] = (uint32_t) rollback; }
                         rs_last_T[seq_id] = 0;
                         cell.pos = p0 - 1;
                         return true;
@@ -227,6 +276,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 }
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
+                    if (ring) { rs_rb[seq_id] = (uint32_t) rollback; }
                     cell.pos = p0 - 1;
                     return true;
                 }
@@ -436,7 +486,11 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_rb.begin(), rs_rb.end(), 0);
         return;
+    }
+    if (idx == 0 && (size_t) seq_id < rs_rb.size()) {
+        rs_rb[seq_id] = 0;
     }
 
     assert(n_seq_max == rs_idx.size());
@@ -445,6 +499,48 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     GGML_ASSERT(idx <= n_rs_seq);
 
     rs_idx[seq_id] = idx;
+}
+
+void llama_memory_recurrent::ring_ctl(uint32_t i, uint32_t n_tokens, int32_t * out) {
+    const uint32_t cell_idx = head + i;
+    GGML_ASSERT(cell_idx < size);
+    const mem_cell & cell = cells[cell_idx];
+    const int32_t    src0 = cell.src0;
+    const llama_seq_id seq = cell.seq_id.empty() ? -1 : *cell.seq_id.begin();
+
+    // a source equal to rs_z is the freshly zeroed state: nothing to fold
+    // (find_slot only points a cell at rs_z when the cell was cleared: rs_z has no src references)
+    const bool zeroed = src0 < 0 || (rs_z >= 0 && src0 == rs_z);
+
+    uint32_t n_commit = 0;
+    uint32_t row_r    = 0;
+    if (!zeroed) {
+        const uint32_t len = ring_len[src0];
+        const uint32_t rb  = seq >= 0 && (size_t) seq < rs_rb.size() ? rs_rb[seq] : 0;
+        GGML_ASSERT(rb <= len);
+        n_commit = len - rb;
+        row_r    = 2*(uint32_t) src0 + ring_par[src0];
+    }
+    const uint32_t par_w = src0 == (int32_t) cell_idx ? (ring_par[cell_idx] ^ 1u) : 0u;
+    const uint32_t row_w = 2*cell_idx + par_w;
+
+    ring_len[cell_idx] = std::min<uint32_t>(n_tokens, ring_R);
+    ring_par[cell_idx] = par_w;
+    if (seq >= 0 && (size_t) seq < rs_rb.size()) {
+        rs_rb[seq] = 0;
+    }
+
+    out[0] = (int32_t) n_commit;
+    out[1] = (int32_t) row_r;
+    out[2] = (int32_t) row_w;
+}
+
+void llama_memory_recurrent::ring_current(uint32_t cell, uint32_t & n_commit, uint32_t & row) const {
+    const llama_seq_id seq = cells[cell].seq_id.empty() ? -1 : *cells[cell].seq_id.begin();
+    const uint32_t len = ring_len[cell];
+    const uint32_t rb  = seq >= 0 && (size_t) seq < rs_rb.size() ? rs_rb[seq] : 0;
+    n_commit = len >= rb ? len - rb : 0;
+    row      = 2*cell + ring_par[cell];
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -983,7 +1079,25 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (const auto & range : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                // [rs-ring] s has one group: drop the rollback-plane offset
+                const size_t first = ring ? range.first % size : range.first;
+                io.write_tensor(s_l[il], first * s_size_row, buf_size);
+            }
+
+            // [rs-ring] the ring tokens not yet folded into s travel with it
+            if (ring) {
+                const uint32_t magic = 0x31474E52; // "RNG1"
+                uint32_t n_commit = 0;
+                uint32_t row      = 0;
+                if (!cell_ranges.empty()) {
+                    GGML_ASSERT(cell_ranges.size() == 1 && cell_ranges[0].second - cell_ranges[0].first == 1);
+                    ring_current(cell_ranges[0].first % size, n_commit, row);
+                }
+                io.write(&magic,    sizeof(magic));
+                io.write(&n_commit, sizeof(n_commit));
+                if (n_commit > 0) {
+                    io.write_tensor(ring_l[il], row * ring_l[il]->nb[1], (size_t) n_commit * ring_TS * sizeof(float));
+                }
             }
         }
     } else {
@@ -1205,6 +1319,24 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                 // Read and set the values for the whole cell range
                 io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
             }
+
+            // [rs-ring]
+            if (ring) {
+                uint32_t magic = 0, n_commit = 0;
+                io.read(&magic,    sizeof(magic));
+                io.read(&n_commit, sizeof(n_commit));
+                if (magic != 0x31474E52 || n_commit > ring_R || (n_commit > 0 && cell_count != 1)) {
+                    LLAMA_LOG_ERROR("%s: rs-ring: incompatible state (magic %08x, n_commit %u)\n", __func__, magic, n_commit);
+                    return false;
+                }
+                if (n_commit > 0) {
+                    io.read_tensor(ring_l[il], (size_t) (2*head) * ring_l[il]->nb[1], (size_t) n_commit * ring_TS * sizeof(float));
+                }
+                if (cell_count == 1) {
+                    ring_len[head] = n_commit;
+                    ring_par[head] = 0;
+                }
+            }
         }
     } else {
         // For each layer, read the values for each cell (transposed)
@@ -1362,4 +1494,24 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+bool llama_memory_recurrent_context::is_ring() const {
+    return mem->ring;
+}
+
+uint32_t llama_memory_recurrent_context::get_ring_R() const {
+    return mem->ring_R;
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_ring_l(int32_t il) const {
+    return mem->ring_l[il];
+}
+
+int32_t llama_memory_recurrent_context::s_copy_ring(int i) const {
+    return mem->cells[i + mem->head].src0;
+}
+
+void llama_memory_recurrent_context::ring_ctl(int i, uint32_t n_tokens, int32_t * out) const {
+    mem->ring_ctl((uint32_t) i, n_tokens, out);
 }

@@ -82,6 +82,22 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // [rs-ring] LLAMA_RS_RING=1: no per-token state snapshots. s_l keeps ONE state per cell (the state
+    // before the last ring_len tokens of that cell); ring_l keeps those tokens' (k, exp(g), delta) so a
+    // rollback of up to ring_len tokens is a fold at the start of the next pass (ggml_gated_delta_net_ring).
+    bool     ring   = false;
+    uint32_t ring_R = 0;  // ring capacity in tokens
+    int64_t  ring_TS = 0; // floats per token
+    std::vector<ggml_tensor *> ring_l;    // per layer: F32 [ring_R*ring_TS, 2*size] (two rows per cell)
+    std::vector<uint32_t>      ring_len;  // per cell: tokens held in its current ring row
+    std::vector<uint32_t>      ring_par;  // per cell: which of its two rows is current
+    std::vector<uint32_t>      rs_rb;     // per seq: pending rollback in tokens
+
+    // fills {n_commit, row to fold from, row to write} for cell head+i and advances the ring bookkeeping
+    void ring_ctl(uint32_t i, uint32_t n_tokens, int32_t * out);
+    // n_commit and ring row of the logical state of a cell (for state save)
+    void ring_current(uint32_t cell, uint32_t & n_commit, uint32_t & row) const;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -180,6 +196,13 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // [rs-ring]
+    bool          is_ring()    const;
+    uint32_t      get_ring_R() const;
+    ggml_tensor * get_ring_l(int32_t il) const;
+    int32_t       s_copy_ring(int i) const;            // source cell row in s_l (one group)
+    void          ring_ctl(int i, uint32_t n_tokens, int32_t * out) const;
 
 private:
     const llama_memory_status status;
