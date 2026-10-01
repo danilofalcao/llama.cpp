@@ -35,6 +35,7 @@ static inputs make(int T, std::mt19937 & rng) {
 struct runner {
     ggml_backend_t be;
     explicit runner(ggml_backend_t be) : be(be) {}
+    int perf_reps = 0; double last_us = 0;
 
     // runs one op; returns dst (attn | states). ring/ctl used when R > 0 (ring updated in place)
     std::vector<float> run(const inputs & x, const std::vector<float> & s0, int K, int R,
@@ -72,6 +73,12 @@ struct runner {
             ggml_backend_tensor_set(c, ctl, 0, ggml_nbytes(c));
         }
         if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) { fprintf(stderr, "compute failed\n"); exit(1); }
+        if (perf_reps > 0) {
+            const int64_t t0 = ggml_time_us();
+            for (int i = 0; i < perf_reps; ++i) ggml_backend_graph_compute(be, gf);
+            ggml_backend_synchronize(be);
+            last_us = (double) (ggml_time_us() - t0) / perf_reps;
+        }
         std::vector<float> res(ggml_nelements(out));
         ggml_backend_tensor_get(out, res.data(), 0, ggml_nbytes(out));
         if (R > 0) ggml_backend_tensor_get(rg, ring->data(), 0, ggml_nbytes(rg));
@@ -101,6 +108,25 @@ int main(int argc, char ** argv) {
     runner rn(be);
     std::mt19937 rng(1234);
     const size_t D = (size_t) S*S*HV;
+
+    if (argc > 2 && strcmp(argv[2], "perf") == 0) {
+        // kernel time per call: snapshot mode (K = 7, production) vs ring mode (R = 40), several T
+        for (int T : {1, 7, 40, 64, 256}) {
+            std::vector<float> s0(D, 0.01f);
+            inputs X = make(T, rng);
+            std::vector<float> ring;
+            int32_t ctl[3] = {0, 0, 1};
+            rn.perf_reps = 200;
+            for (int mode = 0; mode < 3; ++mode) {
+                if (mode == 0) rn.run(X, s0, 7, 0, nullptr, nullptr);
+                else if (mode == 1) rn.run(X, s0, 1, 0, nullptr, nullptr);
+                else rn.run(X, s0, 1, 40, &ring, ctl);
+                printf("T=%3d %-14s %8.1f us/graph\n", T, mode == 0 ? "snapshot K=7" : mode == 1 ? "plain K=1" : "ring R=40", rn.last_us);
+            }
+            rn.perf_reps = 0;
+        }
+        return 0;
+    }
 
     struct cs { int T1, m, T2, R; };
     for (cs c : std::vector<cs>{{7,1,7,7},{7,3,7,7},{7,7,7,7},{7,0,1,7},{1,1,7,7},{20,15,7,7},{20,13,6,7},{40,17,7,40},{256,230,7,40},{100,90,40,40}}) {
