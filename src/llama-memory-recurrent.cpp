@@ -28,6 +28,10 @@ static bool rs_ring_enabled() {
     static const bool v = [] { const char * e = getenv("LLAMA_RS_RING"); return e && atoi(e) != 0; }();
     return v;
 }
+static bool rs_ring_log() {
+    static const bool v = [] { const char * e = getenv("LLAMA_RS_RING_LOG"); return e && atoi(e) != 0; }();
+    return v;
+}
 static long rs_long_ckpt_max_t() {
     static const long v = [] { const char * e = getenv("LLAMA_RS_LONG_CKPT_MAX_T"); const long n = e ? atol(e) : 64; return n > 0 ? n : 64; }();
     return v;
@@ -254,7 +258,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const bool pending = rs_idx[seq_id] != 0;
                 // [rs-ring] the ring must hold the tokens to drop
                 if (ring && (rollback < 1 || rollback > (llama_pos) ring_len[tail_id])) {
+                    LLAMA_LOG_WARN("%s: rs-ring: rollback of %d tokens refused (ring holds %u, seq %d, pos %d)\n",
+                            __func__, (int) rollback, ring_len[tail_id], seq_id, (int) cell.pos);
                     return false;
+                }
+                if (ring && rs_ring_log()) {
+                    LLAMA_LOG_WARN("%s: rs-ring: rollback %d (ring %u, pending %d)\n", __func__, (int) rollback, ring_len[tail_id], (int) pending);
                 }
                 // [rs-long-ckpt] after a long pass: snapshots cover rollback 1..n_rs_seq-1, group n_rs_seq = pre-pass
                 const uint32_t T_last = (size_t) seq_id < rs_last_T.size() ? rs_last_T[seq_id] : 0;
@@ -533,6 +542,10 @@ void llama_memory_recurrent::ring_ctl(uint32_t i, uint32_t n_tokens, int32_t * o
     out[0] = (int32_t) n_commit;
     out[1] = (int32_t) row_r;
     out[2] = (int32_t) row_w;
+    if (rs_ring_log()) {
+        LLAMA_LOG_WARN("%s: rs-ring: cell %u T %u -> fold %u from row %u, store %u into row %u (src0 %d, rs_z %d)\n",
+                __func__, cell_idx, n_tokens, n_commit, row_r, ring_len[cell_idx], row_w, src0, rs_z);
+    }
 }
 
 void llama_memory_recurrent::ring_current(uint32_t cell, uint32_t & n_commit, uint32_t & row) const {
