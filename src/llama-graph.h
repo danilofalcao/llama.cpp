@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "ggml-cpp.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -139,6 +140,22 @@ public:
     const int64_t n_embd = 0;
 };
 
+// Owned storage, independent of scheduler graph allocations.
+struct llm_mtp_hidden {
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buffer;
+    ggml_tensor * row = nullptr;
+    bool enabled = false;
+    bool configured = false; // keep input placement stable between draft and catch-up graphs
+    bool ready = false;
+    bool host_pending = false;
+    bool failed = false; // latch unsupported placement/allocation failure for this context
+
+    bool capture(ggml_backend_sched_t sched, ggml_tensor * src);
+    bool set_input(ggml_backend_sched_t sched, ggml_tensor * dst);
+    void materialize(float * dst);
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
@@ -154,6 +171,8 @@ public:
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+    llm_mtp_hidden * device_h = nullptr;
+    ggml_backend_sched_t sched = nullptr;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -815,6 +834,7 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    llm_mtp_hidden * device_h = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases

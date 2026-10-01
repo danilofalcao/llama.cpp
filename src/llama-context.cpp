@@ -482,6 +482,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    device_h.buffer.reset();
+    device_h.ctx.reset();
+    device_h.row = nullptr;
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1068,13 +1071,32 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+bool llama_context::set_mtp_device_h(bool enabled) {
+    device_h.materialize(embd_nextn.data);
+    device_h.ready = false;
+    const bool was_configured = device_h.configured;
+    device_h.enabled = enabled && !device_h.failed && model.dev_output() &&
+        ggml_backend_dev_type(model.dev_output()) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+        (model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) &&
+        model.hparams.n_layer_nextn == 1 && cparams.n_seq_max == 1 &&
+        cparams.embeddings_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE;
+    device_h.configured = device_h.configured || device_h.enabled;
+    if (was_configured != device_h.configured) {
+        gf_res_prev_active = nullptr;
+    }
+    return device_h.enabled;
+}
+
 float * llama_context::get_embeddings_nextn() {
+    device_h.materialize(embd_nextn.data);
     output_reorder();
 
     return embd_nextn.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+    device_h.materialize(embd_nextn.data);
     output_reorder();
 
     try {
@@ -1769,6 +1791,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (device_h.enabled && (batch_inp.n_tokens != 1 || !batch_inp.token || !batch_inp.embd ||
+            !batch_inp.logits || !batch_inp.logits[0] ||
+            (batch_inp.n_seq_id && batch_inp.n_seq_id[0] != 1))) {
+        set_mtp_device_h(false);
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2091,7 +2118,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                if (!(device_h.enabled && n_tokens_all == 1 && n_rows == 1 && offset == 0 &&
+                        t_h_nextn->ne[0] == n_embd && device_h.capture(sched.get(), t_h_nextn))) {
+                    device_h.ready = false;
+                    device_h.host_pending = false;
+                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                }
             }
         }
 
@@ -2632,6 +2664,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.device_h    =*/ &device_h,
     };
 }
 
@@ -2693,6 +2726,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
                 }
             }
             return;
+        }
+
+        if (device_h.configured && il >= 0 && strcmp(name, "mtp_h_input") == 0) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == model.dev_layer(il) &&
+                        ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
+                }
+            }
         }
 
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
@@ -3464,6 +3507,18 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     file.write_u32((uint32_t) n_token_count);
     file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
+    // Durable files must not reference the RPC server's bounded, evictable KV store.
+    // Keep the fast reference path for in-memory prompt/checkpoint caches only.
+    struct save_bytes_scope {
+        bool (*fn)(bool) = nullptr;
+        bool previous = false;
+        save_bytes_scope() {
+            auto reg = ggml_backend_reg_by_name("RPC");
+            fn = reg ? (bool (*)(bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_state_save_bytes") : nullptr;
+            if (fn) previous = fn(true);
+        }
+        ~save_bytes_scope() { if (fn) fn(previous); }
+    } save_bytes;
     // save the context state using stream saving
     llama_io_write_file io(&file);
     state_seq_write_data(io, seq_id, 0);
@@ -3495,6 +3550,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    set_mtp_device_h(false);
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -3529,6 +3585,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    set_mtp_device_h(false);
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4113,6 +4170,14 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+bool llama_set_mtp_device_h(llama_context * ctx, bool enabled) {
+    return ctx && ctx->set_mtp_device_h(enabled);
+}
+
+bool llama_mtp_device_h_ready(const llama_context * ctx) {
+    return ctx && ctx->mtp_device_h_ready();
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

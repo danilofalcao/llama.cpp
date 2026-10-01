@@ -5,11 +5,13 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "log.h"
+#include "mtp-adaptive.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-mtp.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -18,6 +20,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1353,6 +1356,8 @@ static const std::vector<llama_token> & mtp_draft_rows() {
 }
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    std::vector<bool> compact_sampling;
+    int64_t compact_rows = 0;
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -1371,6 +1376,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    device_h = false;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1387,6 +1393,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    bool adaptive = false;
+    FILE * trace = nullptr;
+    std::vector<common_mtp_adaptive> controllers;
+    std::vector<common_mtp_round> rounds;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1426,11 +1437,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
+        const char * compact = std::getenv("LLAMA_MTP_COMPACT");
+        if (compact && std::strcmp(compact, "1") == 0 && this->params.p_min == 0.0f && this->params.backend_sampling) {
+            compact_rows = llama_mtp_compact_rows(llama_get_model(ctx_dft), mtp_draft_rows());
+            SPC_INF("compact MTP selection: %lld rows (zero means incompatible head/map)\n", (long long) compact_rows);
+        }
+
         // offload draft sampling to the backend
+        compact_sampling.assign(n_seq, false);
         backend_chains.assign(n_seq, nullptr);
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                if (compact_rows > 0) {
+                    auto * scalar = llama_mtp_sampler_init(compact_rows);
+                    llama_sampler_chain_add(chain, scalar);
+                    const bool attached = llama_set_sampler(ctx_dft, seq_id, chain);
+                    if (attached && ((llama_mtp_sampler_context *) scalar->ctx)->supported) {
+                        compact_sampling[seq_id] = true;
+                        backend_chains[seq_id] = chain;
+                        continue;
+                    }
+                    llama_set_sampler(ctx_dft, seq_id, nullptr);
+                    llama_sampler_free(chain);
+                    chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                    SPC_WRN("compact MTP unsupported for seq_id=%d; using top-k fallback\n", (int) seq_id);
+                }
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
@@ -1447,6 +1479,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        const char * device_h_env = std::getenv("LLAMA_MTP_DEVICE_H");
+        device_h = device_h_env && std::strcmp(device_h_env, "1") == 0 &&
+            n_seq == 1 && !chain_heads && !is_mem_shared;
+        if (device_h) {
+            // Configure placement once, before any prompt graphs are built. Only recurrence
+            // consumption is toggled at draft boundaries; graph topology stays stable.
+            device_h = llama_set_mtp_device_h(ctx_dft, true);
+            llama_set_mtp_device_h(ctx_dft, false);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1457,6 +1498,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+
+        const char * adapt_env = std::getenv("LLAMA_MTP_ADAPT");
+        adaptive = adapt_env && std::strcmp(adapt_env, "1") == 0;
+        const char * trace_path = std::getenv("LLAMA_MTP_TRACE");
+        if (trace_path && *trace_path) {
+            trace = std::fopen(trace_path, "a");
+            if (trace) {
+                std::setvbuf(trace, nullptr, _IOLBF, 0);
+            } else {
+                SPC_WRN("cannot open MTP trace: %s\n", trace_path);
+            }
+        }
+        controllers.resize(n_seq);
+        rounds.resize(n_seq);
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -1469,6 +1524,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_mtp() override {
+        if (trace) {
+            std::fclose(trace);
+        }
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
             if (backend_chains[seq_id] == nullptr) {
@@ -1508,6 +1566,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            controllers[seq_id].reset();
+            rounds[seq_id] = {};
+        }
         if (!mtp_state_enabled() || seq_id < 0 || seq_id >= (llama_seq_id) pending_h.size() || data.size() != pending_h[seq_id].size() * sizeof(float)) {
             return;
         }
@@ -1515,6 +1577,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        controllers[seq_id].reset();
+        rounds[seq_id] = {};
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1533,6 +1597,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        if (device_h) {
+            llama_set_mtp_device_h(params.ctx_dft, false);
+        }
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1646,19 +1713,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+        const bool measured = adaptive || trace;
+        const int64_t start_us = measured ? ggml_time_us() : 0;
 
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<int> depths(n_seq, params.n_max);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        struct device_h_scope {
+            llama_context * ctx;
+            ~device_h_scope() { if (ctx) { llama_set_mtp_device_h(ctx, false); } }
+        } device_scope { device_h ? ctx_dft : nullptr };
+        if (device_h) {
+            llama_set_mtp_device_h(ctx_dft, true);
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
             if (!dp.drafting) {
+                continue;
+            }
+
+            // Keep the legacy generation/minimum/truncation ordering when adaptation is off.
+            depths[seq_id] = adaptive ? common_mtp_adaptive::limit(params.n_max, dp.n_max) : params.n_max;
+            if (adaptive && params.n_min <= 6) {
+                depths[seq_id] = controllers[seq_id].choose(depths[seq_id], params.n_min);
+            }
+            rounds[seq_id].start(depths[seq_id], dp.pos0, start_us);
+            if (depths[seq_id] == 0) {
                 continue;
             }
 
@@ -1713,19 +1801,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                const bool resident_h = device_h && llama_mtp_device_h_ready(ctx_dft);
+                const float * h_row = resident_h ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                llama_token id;
+                float p = 1.0f;
+                if (compact_sampling[seq_id]) {
+                    // Scalar output has no logits: do not call common_sampler_sample/set_logits.
+                    id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
+                    if (id < 0 || id >= compact_rows) {
+                        SPC_WRN("invalid compact MTP row %d for seq_id=%d; stop drafting\n", id, (int) seq_id);
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                } else {
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    id = cur_p->data[0].id;
+                    p = cur_p->data[0].p;
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
                 }
 
                 // add drafted token for each sequence
-                llama_token id = cur_p->data[0].id;
                 {
                     const auto & rows = mtp_draft_rows(); // PATCH(mtp-head-freq): head row -> token id
                     if (!rows.empty() && id >= 0 && (size_t) id < rows.size()) {
@@ -1734,7 +1835,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1748,7 +1849,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (depths[seq_id] <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1772,7 +1873,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 } else {
                     common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
-                    std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    if (!resident_h) {
+                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
+                    }
                 }
 
                 i_last[seq_id] = batch.n_tokens - 1;
@@ -1795,15 +1898,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
-            if (dp.result->size() < (size_t) params.n_min) {
+            if (dp.result->size() < (size_t) (adaptive ? std::min(params.n_min, depths[seq_id]) : params.n_min)) {
                 dp.result->clear();
+            }
+            if (measured) {
+                rounds[seq_id].finish_draft((int) dp.result->size(), ggml_time_us());
             }
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        auto & round = rounds[seq_id];
+        if ((adaptive || trace) && round.finish_accept(n_accepted, is_other, ggml_time_us())) {
+            if (adaptive) {
+                controllers[seq_id].observe(round.depth, n_accepted, round.round_us / 1000.0);
+            }
+            if (trace) {
+                // Integer and fractional parts keep JSON numbers independent of the locale.
+                std::fprintf(trace, "{\"seq\":%d,\"length\":%d,\"accepted\":%u,\"context\":%d,\"draft_ms\":%" PRId64 ".%03" PRId64 ",\"round_ms\":%" PRId64 ".%03" PRId64 "}\n",
+                        (int) seq_id, round.length, (unsigned) n_accepted, round.context,
+                        round.draft_us / 1000, round.draft_us % 1000, round.round_us / 1000, round.round_us % 1000);
+            }
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];

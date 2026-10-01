@@ -91,6 +91,69 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+static bool mtp_same_layout(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->type == b->type &&
+        std::memcmp(a->ne, b->ne, sizeof(a->ne)) == 0 &&
+        std::memcmp(a->nb, b->nb, sizeof(a->nb)) == 0;
+}
+
+bool llm_mtp_hidden::capture(ggml_backend_sched_t sched, ggml_tensor * src) {
+    ready = false;
+    host_pending = false;
+    if (!enabled || failed || !src || !src->buffer || src->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(src) || ggml_nrows(src) != 1 ||
+            ggml_backend_buffer_is_host(src->buffer)) {
+        failed = true;
+        return false;
+    }
+
+    // Complete graph work before reading or replacing owned storage.
+    ggml_backend_sched_synchronize(sched);
+    auto buft = ggml_backend_buffer_get_type(src->buffer);
+    if (!row || !buffer || ggml_backend_buffer_get_type(buffer.get()) != buft ||
+            !mtp_same_layout(src, row)) {
+        buffer.reset();
+        ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        row = nullptr;
+        if (!ctx) {
+            failed = true;
+            return false;
+        }
+        row = ggml_dup_tensor(ctx.get(), src);
+        buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+        if (!buffer) {
+            row = nullptr;
+            failed = true;
+            return false;
+        }
+    }
+    if (!mtp_same_layout(src, row)) {
+        failed = true;
+        return false;
+    }
+    ggml_backend_tensor_copy(src, row);
+    ready = true;
+    host_pending = true;
+    return true;
+}
+
+bool llm_mtp_hidden::set_input(ggml_backend_sched_t sched, ggml_tensor * dst) {
+    if (!enabled || !ready || !dst || !dst->buffer || !mtp_same_layout(row, dst)) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(sched);
+    ggml_backend_tensor_copy(row, dst);
+    ready = false;
+    return true;
+}
+
+void llm_mtp_hidden::materialize(float * dst) {
+    if (host_pending && dst) {
+        ggml_backend_tensor_get(row, dst, 0, ggml_nbytes(row));
+        host_pending = false;
+    }
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -110,7 +173,21 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     if (ubatch->embd) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        const bool had_device_row = device_h && device_h->enabled && device_h->ready;
+        if (!ubatch->token || n_tokens != 1 || !device_h || !device_h->set_input(sched, h)) {
+            if (had_device_row) {
+                // The caller intentionally left batch.embd stale. Never upload it on a D2D fallback.
+                GGML_ASSERT(device_h->row && ggml_is_contiguous(h) &&
+                    ggml_nelements(device_h->row) == ggml_nelements(h));
+                std::vector<float> host(ggml_nelements(h));
+                ggml_backend_tensor_get(device_h->row, host.data(), 0, ggml_nbytes(device_h->row));
+                ggml_backend_tensor_set(h, host.data(), 0, ggml_nbytes(h));
+                device_h->ready = false;
+                device_h->failed = true;
+            } else {
+                ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+            }
+        }
     }
 }
 

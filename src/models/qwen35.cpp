@@ -1,7 +1,75 @@
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-mtp.h"
+
+int64_t llama_mtp_compact_rows(const llama_model * model, const std::vector<llama_token> & rows) {
+    if (model->arch != LLM_ARCH_QWEN35 || model->hparams.n_layer_nextn != 1) {
+        return 0;
+    }
+    const char * scatter = std::getenv("LLAMA_MTP_HEAD_SCATTER");
+    if (scatter && std::atoi(scatter) != 0) {
+        return 0;
+    }
+    const auto & layer = model->layers.at(model->hparams.n_layer());
+    const auto * head = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model->output;
+    const auto * scale = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model->output_s;
+    const int64_t n_vocab = model->vocab.n_tokens();
+    if (!head || scale || ggml_is_transposed(head) || head->ne[1] <= 0 || head->ne[1] > n_vocab) {
+        return 0;
+    }
+    const int64_t n_head = head->ne[1];
+    int64_t n_rows = n_head;
+    const char * limit = std::getenv("LLAMA_MTP_DRAFT_VOCAB");
+    const int64_t k = limit ? std::atoll(limit) : 0;
+    if (k > 0 && k < n_rows) {
+        n_rows = k;
+    }
+    if (n_rows >= n_vocab) {
+        return 0;
+    }
+    if (const char * path = std::getenv("LLAMA_MTP_DRAFT_ROWS")) {
+        std::ifstream file(path);
+        for (const auto id : rows) {
+            int64_t parsed;
+            if (!(file >> parsed) || parsed != id) {
+                return 0;
+            }
+        }
+        file >> std::ws;
+        if (!file.eof() || rows.empty()) {
+            return 0;
+        }
+    }
+    if (model->output_inv) {
+        if (rows.size() != (size_t) n_head || model->output_inv->type != GGML_TYPE_I32 ||
+                ggml_nelements(model->output_inv) != n_vocab) {
+            return 0;
+        }
+        std::vector<int32_t> inverse(n_vocab);
+        ggml_backend_tensor_get(model->output_inv, inverse.data(), 0, inverse.size() * sizeof(int32_t));
+        if (!llama_mtp_validate_rows(rows, inverse, n_head)) {
+            return 0;
+        }
+    } else {
+        if (std::getenv("LLAMA_MTP_DRAFT_ROWS") && rows.empty()) {
+            return 0;
+        }
+        if (!rows.empty()) {
+            if (rows.size() != (size_t) n_head) {
+                return 0;
+            }
+            for (int64_t i = 0; i < n_head; ++i) {
+                if (rows[i] != i) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return n_rows;
+}
 
 // PATCH(xdev-act): LLAMA_XDEV_ACT=bf16|f16 narrows the hidden state wherever it crosses to another device
 // (input embeddings -> first layer, layer -> layer on another device, last layer -> output device). The
@@ -609,6 +677,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    inp->device_h = params.device_h;
+    inp->sched = params.sched;
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
@@ -631,6 +701,9 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
+    if (params.device_h && params.device_h->configured) {
+        cb(inp->h, "mtp_h_input", il);
+    }
 
     ggml_tensor * h_embd = inp->h;
 

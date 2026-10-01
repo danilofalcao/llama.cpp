@@ -16,6 +16,13 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Scope device hidden recurrence to a single-sequence Qwen3.5 MTP draft loop.
+// Enabling starts with host input. Disabling restores the last CPU output row.
+// Readiness means the next one-token decode can omit updating batch.embd.
+// The batch must still provide valid token and embd storage.
+LLAMA_API bool llama_set_mtp_device_h(struct llama_context * ctx, bool enabled);
+LLAMA_API bool llama_mtp_device_h_ready(const struct llama_context * ctx);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

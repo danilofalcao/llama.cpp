@@ -924,6 +924,13 @@ static std::atomic<int> rpc_state_ref_misses{0};
 // save, so both are kept and evicted together (the state cache churns with every checkpoint).
 // per thread: with LLAMA_MULTI two server instances save states from different threads
 static thread_local int rpc_state_ref_recurrent = 0;
+// File snapshots must carry bytes, not references into an evictable remote cache.
+static thread_local bool rpc_state_save_bytes = false;
+static bool ggml_backend_rpc_state_save_bytes(bool enabled) {
+    const bool previous = rpc_state_save_bytes;
+    rpc_state_save_bytes = enabled;
+    return previous;
+}
 
 static void ggml_backend_rpc_state_ref_recurrent(int on) {
     rpc_state_ref_recurrent = on;
@@ -934,7 +941,7 @@ static bool rpc_use_state_ref(const ggml_tensor * tensor, size_t size, bool save
         const char * e = std::getenv("GGML_RPC_STATE_REF");
         return e != nullptr && std::atoi(e) != 0;
     }();
-    if (!enabled || size < RPC_STATE_MIN_SIZE) {
+    if (!enabled || size < RPC_STATE_MIN_SIZE || (save && rpc_state_save_bytes)) {
         return false;
     }
     if (strncmp(tensor->name, "cache_k_l", 9) == 0 || strncmp(tensor->name, "cache_v_l", 9) == 0) {
@@ -3586,6 +3593,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_state_ref_take_misses") == 0) { // PATCH(rpc-state-ref)
         return (void *)ggml_backend_rpc_state_ref_take_misses;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_state_save_bytes") == 0) {
+        return (void *) ggml_backend_rpc_state_save_bytes;
     }
     if (std::strcmp(name, "ggml_backend_rpc_state_ref_recurrent") == 0) { // PATCH(ckpt-rpc-ref)
         return (void *)ggml_backend_rpc_state_ref_recurrent;

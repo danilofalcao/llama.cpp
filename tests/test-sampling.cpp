@@ -1,5 +1,7 @@
 #include "ggml.h"
 #include "llama.h"
+#include "ggml-alloc.h"
+#include "../src/llama-mtp.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -335,8 +337,71 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+static void test_mtp_compact() {
+    GGML_ASSERT(llama_mtp_validate_rows({ 3, 1 }, { 2, 1, 2, 0 }, 2));
+    GGML_ASSERT(!llama_mtp_validate_rows({ 3 }, { 2, 1, 2, 0 }, 2));
+    GGML_ASSERT(!llama_mtp_validate_rows({ 3, 3 }, { 2, 1, 2, 0 }, 2));
+    GGML_ASSERT(!llama_mtp_validate_rows({ -1, 1 }, { 2, 1, 2, 0 }, 2));
+    GGML_ASSERT(!llama_mtp_validate_rows({ 4, 1 }, { 2, 1, 2, 0 }, 2));
+    GGML_ASSERT(!llama_mtp_validate_rows({ 1, 3 }, { 2, 1, 2, 0 }, 2));
+
+    ggml_backend_load_all();
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!dev) {
+        printf("compact MTP graph tests skipped: no CPU backend\n");
+        return;
+    }
+    auto * backend = ggml_backend_dev_init(dev, nullptr);
+    GGML_ASSERT(backend);
+    auto * sampler = llama_mtp_sampler_init(3);
+    GGML_ASSERT(sampler->iface->backend_init(sampler, ggml_backend_get_default_buffer_type(backend), 2));
+    auto * clone = llama_sampler_clone(sampler);
+    llama_sampler_copy(sampler, clone);
+    GGML_ASSERT(((llama_mtp_sampler_context *) clone->ctx)->n_rows == 3);
+    llama_sampler_free(clone);
+
+    ggml_init_params params = { 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false), nullptr, true };
+    auto * ctx = ggml_init(params);
+    auto * gf = ggml_new_graph_custom(ctx, 16, false);
+    auto * logits = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5);
+    llama_sampler_data data = { logits, logits, nullptr, logits };
+    sampler->iface->backend_apply(sampler, ctx, gf, &data);
+    GGML_ASSERT(!data.logits && !data.probs && !data.candidates);
+    GGML_ASSERT(ggml_nelements(data.sampled) == 1 && data.sampled->type == GGML_TYPE_I32);
+    GGML_ASSERT(data.sampled->src[0]->ne[0] == 3);
+    ggml_build_forward_expand(gf, data.sampled);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    GGML_ASSERT(buffer);
+
+    const std::vector<std::vector<float>> cases = {
+        { 10001, 10003, 10002, 20000, 20000 },
+        { 10003, 10003, 10002, 0, 0 },
+        { NAN, 10003, 10002, 0, 0 },
+        { -INFINITY, -INFINITY, -INFINITY, 0, 0 },
+    };
+    for (size_t i = 0; i < cases.size(); ++i) {
+        ggml_backend_tensor_set(logits, cases[i].data(), 0, cases[i].size() * sizeof(float));
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        int32_t row = -1;
+        ggml_backend_tensor_get(data.sampled, &row, 0, sizeof(row));
+        GGML_ASSERT(row >= 0 && row < 3);
+        if (i == 0 || i == 2) {
+            GGML_ASSERT(row == 1);
+        } else if (i == 1) {
+            GGML_ASSERT(row == 0 || row == 1);
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    llama_sampler_free(sampler);
+    ggml_backend_free(backend);
+    printf("compact MTP sampler tests passed\n");
+}
+
 int main(void) {
     ggml_time_init();
+
+    test_mtp_compact();
 
     test_dist_singleton_rng();
 
