@@ -443,6 +443,7 @@ enum llm_tensor {
     LLM_TENSOR_DENSE_2_OUT,
     LLM_TENSOR_DENSE_3_OUT,
     LLM_TENSOR_OUTPUT,
+    LLM_TENSOR_OUTPUT_INV, // PATCH(mtp-head-freq): I32 [n_vocab] head row of every token id (n_rows = not in the head)
     LLM_TENSOR_OUTPUT_NORM,
     LLM_TENSOR_OUTPUT_NORM_LFM2, // fix for wrong tensor name
     LLM_TENSOR_ROPE_FREQS,

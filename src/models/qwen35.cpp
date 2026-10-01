@@ -104,6 +104,13 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         }
     }
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab_head }, TENSOR_NOT_REQUIRED);
+    // PATCH(mtp-head-freq): a draft head made of SELECTED rows (not the first K) carries the inverse map
+    if (mtp_only && n_vocab_head < n_vocab) {
+        output_inv = create_tensor(tn(LLM_TENSOR_OUTPUT_INV), { n_vocab }, TENSOR_NOT_REQUIRED);
+        if (output_inv) {
+            LLAMA_LOG_WARN("%s: mtp-head-freq: draft LM head holds %lld selected vocab rows (output_inv present)\n", __func__, (long long) n_vocab_head);
+        }
+    }
 
     // if output is NULL, init from the input tok embed
     if (output == NULL) {
@@ -760,7 +767,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows_used, head_w->nb[1], 0);
         cur = ggml_mul_mat(ctx0, head_k, cur);
         cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
-        cur = ggml_pad(ctx0, cur, (int) (n_vocab_full - n_rows_used), 0, 0, 0);
+        if (model.output_inv != nullptr && n_rows_used == n_vocab_head) {
+            // PATCH(mtp-head-freq): rows are arbitrary token ids: append a 0 row (= excluded, as the pad below),
+            // then logits[id] = rows[output_inv[id]] with a get_rows over the transposed [n_tokens, K+1] logits
+            cur = ggml_pad(ctx0, cur, 1, 0, 0, 0);
+            cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+            cur = ggml_get_rows(ctx0, cur, model.output_inv);
+            cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        } else {
+            cur = ggml_pad(ctx0, cur, (int) (n_vocab_full - n_rows_used), 0, 0, 0);
+        }
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }
