@@ -581,7 +581,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // [rs-ring] no snapshots: the op writes ONE state (before the ring-held tail of this pass) and the ring
     if (inp->ring_ctl != nullptr) {
         ggml_tensor * gdn_out = ggml_gated_delta_net_ring(ctx0, q, k, v, g, b, s,
-                mctx_cur->get_ring_l(il), inp->ring_ctl, mctx_cur->get_ring_R());
+                mctx_cur->get_ring_l(il), inp->ring_ctl, mctx_cur->get_ring_R(), mctx_cur->get_ring_R_tail());
         if (n_seq_tokens > 1) {
             res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
         } else {

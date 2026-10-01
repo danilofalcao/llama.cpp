@@ -35,7 +35,7 @@ static inputs make(int T, std::mt19937 & rng) {
 struct runner {
     ggml_backend_t be;
     explicit runner(ggml_backend_t be) : be(be) {}
-    int perf_reps = 0; double last_us = 0;
+    int perf_reps = 0; double last_us = 0; int R_tail = 7;
 
     // runs one op; returns dst (attn | states). ring/ctl used when R > 0 (ring updated in place)
     std::vector<float> run(const inputs & x, const std::vector<float> & s0, int K, int R,
@@ -54,7 +54,7 @@ struct runner {
         if (R > 0) {
             rg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, R*TS, 2);
             c  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
-            out = ggml_gated_delta_net_ring(ctx, q, k, v, g, b, s, rg, c, R);
+            out = ggml_gated_delta_net_ring(ctx, q, k, v, g, b, s, rg, c, R, R_tail);
         } else {
             out = ggml_gated_delta_net(ctx, q, k, v, g, b, s, K);
         }
@@ -129,12 +129,12 @@ int main(int argc, char ** argv) {
     }
 
     struct cs { int T1, m, T2, R; };
-    for (cs c : std::vector<cs>{{7,1,7,7},{7,3,7,7},{7,7,7,7},{7,0,1,7},{1,1,7,7},{20,15,7,7},{20,13,6,7},{40,17,7,40},{256,230,7,40},{100,90,40,40}}) {
+    for (cs c : std::vector<cs>{{7,1,7,7},{7,3,7,7},{7,7,7,7},{7,0,1,7},{1,1,7,7},{20,15,7,7},{20,13,6,7},{40,17,7,40},{256,251,7,40},{256,249,7,40},{100,95,40,40},{41,36,7,40}}) {
         printf("T1=%d accept m=%d T2=%d R=%d\n", c.T1, c.m, c.T2, c.R);
         std::vector<float> s0(D); std::uniform_real_distribution<float> u(-0.5f, 0.5f);
         for (auto & f : s0) f = u(rng);
         inputs A = make(c.T1, rng), B = make(c.T2, rng);
-        const int b1 = c.T1 > c.R ? c.T1 - c.R : 0; // ring route: state after b1 tokens, ring holds the rest
+        const int b1 = c.T1 > c.R ? c.T1 - std::min(c.R, 7) : 0; // ring route: state after b1 tokens, ring holds the rest
         const int keep = c.m;                       // tokens of A accepted (m >= b1)
         if (keep < b1) { printf("  skip\n"); continue; }
 

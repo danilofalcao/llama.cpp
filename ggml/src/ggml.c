@@ -6429,8 +6429,9 @@ struct ggml_tensor * ggml_gated_delta_net_ring(
         struct ggml_tensor  * state,
         struct ggml_tensor  * ring,
         struct ggml_tensor  * ctl,
-        int64_t               R) {
-    GGML_ASSERT(R >= 1);
+        int64_t               R,
+        int64_t               R_tail) {
+    GGML_ASSERT(R >= 1 && R_tail >= 0 && R_tail <= R);
     GGML_ASSERT(g->ne[0] == 1); // scalar gate only
     GGML_ASSERT(ring->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(ring));
     GGML_ASSERT(ctl->type == GGML_TYPE_I32 && ggml_is_contiguous(ctl));
@@ -6451,6 +6452,7 @@ struct ggml_tensor * ggml_gated_delta_net_ring(
 
     ggml_set_op_params_i32(result, 1, (int32_t) R);
     ggml_set_op_params_i32(result, 2, (int32_t) H_k);
+    ggml_set_op_params_i32(result, 3, (int32_t) R_tail);
 
     result->src[6] = ring;
     result->src[7] = ctl;

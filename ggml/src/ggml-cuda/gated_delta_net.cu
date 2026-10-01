@@ -34,7 +34,8 @@ gated_delta_net_cuda(const float * q,
                                      const int *   ctl,
                                      int64_t       ring_stride,
                                      int           R,
-                                     int           H_k) {
+                                     int           H_k,
+                                     int           R_tail) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -97,7 +98,7 @@ gated_delta_net_cuda(const float * q,
                 s_shard[r]     = __fmaf_rn(g_val, s_shard[r], __fmul_rn(kr, d_col));
             }
         }
-        ring_b = n_tokens > R ? (int) n_tokens - R : 0;
+        ring_b = n_tokens > R ? (int) n_tokens - R_tail : 0;
         ring_w = ring + (int64_t) c[2] * ring_stride;
         if (ring_b == 0) {
 #pragma unroll
@@ -270,7 +271,7 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream,
-        float * ring = nullptr, const int * ctl = nullptr, int64_t ring_stride = 0, int R = 0, int H_k = 0) {
+        float * ring = nullptr, const int * ctl = nullptr, int64_t ring_stride = 0, int R = 0, int H_k = 0, int R_tail = 0) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -286,26 +287,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, ring_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k, R_tail);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, ring_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k, R_tail);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, ring_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k, R_tail);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, ring_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, ring, ctl, ring_stride, R, H_k, R_tail);
             break;
         }
         default:
@@ -399,7 +400,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream,
             (float *) src_ring->data, (const int *) src_ctl->data,
-            (int64_t) (src_ring->nb[1] / sizeof(float)), R, ggml_get_op_params_i32(dst, 2));
+            (int64_t) (src_ring->nb[1] / sizeof(float)), R, ggml_get_op_params_i32(dst, 2), ggml_get_op_params_i32(dst, 3));
         return;
     }
 

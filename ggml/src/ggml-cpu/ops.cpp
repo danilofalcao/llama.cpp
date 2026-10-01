@@ -11008,7 +11008,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                     ggml_vec_mad_f32(S_v, &s_out[jj * S_v], rj + (ik1 % H_k)*S_v, rj[S_v*H_k + H + iv1*S_v + jj]);
                 }
             }
-            ring_b = n_tokens > R ? n_tokens - R : 0;
+            ring_b = n_tokens > R ? n_tokens - ggml_get_op_params_i32(dst, 3) : 0;
             if (ring_b == 0) {
                 // the cache keeps the state before this pass; the ring keeps this pass
                 memcpy(state_out_base + (iv3 * H + iv1) * S_v * S_v, s_out, S_v * S_v * sizeof(float));

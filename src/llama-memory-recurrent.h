@@ -87,6 +87,7 @@ public:
     // rollback of up to ring_len tokens is a fold at the start of the next pass (ggml_gated_delta_net_ring).
     bool     ring   = false;
     uint32_t ring_R = 0;  // ring capacity in tokens
+    uint32_t ring_R_tail = 0; // tokens kept from a pass longer than ring_R (n_rs_seq + 1, as the snapshots kept)
     int64_t  ring_TS = 0; // floats per token
     std::vector<ggml_tensor *> ring_l;    // per layer: F32 [ring_R*ring_TS, 2*size] (two rows per cell)
     std::vector<uint32_t>      ring_len;  // per cell: tokens held in its current ring row
@@ -200,6 +201,7 @@ public:
     // [rs-ring]
     bool          is_ring()    const;
     uint32_t      get_ring_R() const;
+    uint32_t      get_ring_R_tail() const;
     ggml_tensor * get_ring_l(int32_t il) const;
     int32_t       s_copy_ring(int i) const;            // source cell row in s_l (one group)
     void          ring_ctl(int i, uint32_t n_tokens, int32_t * out) const;

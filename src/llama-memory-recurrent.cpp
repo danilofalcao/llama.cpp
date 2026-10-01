@@ -71,6 +71,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                     ring_R = std::max<uint32_t>(ring_R, (uint32_t) rs_long_ckpt_max_t());
                 }
                 ring_TS = (int64_t) S*H_k + H_v + (int64_t) S*H_v;
+                ring_R_tail = n_rs_seq + 1;
                 ring_len.assign(mem_size, 0);
                 ring_par.assign(mem_size, 0);
                 rs_rb.assign(n_seq_max, 0);
@@ -533,7 +534,7 @@ void llama_memory_recurrent::ring_ctl(uint32_t i, uint32_t n_tokens, int32_t * o
     const uint32_t par_w = src0 == (int32_t) cell_idx ? (ring_par[cell_idx] ^ 1u) : 0u;
     const uint32_t row_w = 2*cell_idx + par_w;
 
-    ring_len[cell_idx] = std::min<uint32_t>(n_tokens, ring_R);
+    ring_len[cell_idx] = n_tokens > ring_R ? ring_R_tail : n_tokens;
     ring_par[cell_idx] = par_w;
     if (seq >= 0 && (size_t) seq < rs_rb.size()) {
         rs_rb[seq] = 0;
@@ -1515,6 +1516,10 @@ bool llama_memory_recurrent_context::is_ring() const {
 
 uint32_t llama_memory_recurrent_context::get_ring_R() const {
     return mem->ring_R;
+}
+
+uint32_t llama_memory_recurrent_context::get_ring_R_tail() const {
+    return mem->ring_R_tail;
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_ring_l(int32_t il) const {

@@ -2681,7 +2681,8 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * ring,
             struct ggml_tensor  * ctl,
-            int64_t               R);
+            int64_t               R,
+            int64_t               R_tail); // tokens kept by a pass LONGER than R (<= R); e.g. 7 for prefill ubatches
 
     // DSA lightning indexer
     //

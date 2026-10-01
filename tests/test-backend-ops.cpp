@@ -4767,7 +4767,7 @@ struct test_gated_delta_net_ring : public test_case {
         ggml_set_name(ring, "ring"); ggml_set_name(ctl, "ctl");
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
-        return ggml_gated_delta_net_ring(ctx, q, k, v, g, beta, state, ring, ctl, R);
+        return ggml_gated_delta_net_ring(ctx, q, k, v, g, beta, state, ring, ctl, R, n_seq_tokens > R ? std::min<int64_t>(R, 7) : R);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -11085,6 +11085,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 1, 1, 7, 4));
     test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 12, 1, 7, 5));  // longer than the ring: direct
     test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 40, 1, 40, 40));
+    test_cases.emplace_back(new test_gated_delta_net_ring(16, 128, 3, 256, 1, 40, 7));  // prefill ubatch: keeps 7
     test_cases.emplace_back(new test_gated_delta_net_ring(4, 64, 2, 5, 2, 6, 6));
     test_cases.emplace_back(new test_gated_delta_net_ring(4, 32, 1, 3, 3, 4, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
