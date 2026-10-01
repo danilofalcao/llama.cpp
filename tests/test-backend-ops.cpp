@@ -11423,8 +11423,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
     }
-    for (int64_t kv : {32768, 131072, 262144}) {
-        for (int64_t nb : {1, 2, 3, 4, 5, 8, 256}) {
+    for (int64_t kv : {32768, 65536, 131072, 172032, 262144}) {
+        for (int64_t nb : {1, 2, 3, 4, 5, 7, 8, 9, 13, 17, 25, 33, 64, 256}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
     }
