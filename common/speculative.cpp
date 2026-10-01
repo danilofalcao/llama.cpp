@@ -1329,6 +1329,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+// PATCH(mtp-head-freq): the draft head may hold SELECTED vocab rows (GGUF with output_inv); its logits then come in
+// row order. LLAMA_MTP_DRAFT_ROWS=<file> lists the token id of every head row (same order as the GGUF rows); the
+// sampled draft candidates are mapped back to token ids. Unset => ids are rows (first-K heads).
+static const std::vector<llama_token> & mtp_draft_rows() {
+    static const std::vector<llama_token> rows = [] {
+        std::vector<llama_token> v;
+        const char * p = std::getenv("LLAMA_MTP_DRAFT_ROWS");
+        if (p != nullptr) {
+            FILE * f = fopen(p, "r");
+            if (f != nullptr) {
+                long long x;
+                while (fscanf(f, "%lld", &x) == 1) {
+                    v.push_back((llama_token) x);
+                }
+                fclose(f);
+            }
+            LOG_WRN("mtp-head-freq: %zu draft head rows mapped to token ids from %s\n", v.size(), p);
+        }
+        return v;
+    }();
+    return rows;
+}
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -1702,7 +1725,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
+                {
+                    const auto & rows = mtp_draft_rows(); // PATCH(mtp-head-freq): head row -> token id
+                    if (!rows.empty() && id >= 0 && (size_t) id < rows.size()) {
+                        id = rows[id];
+                    }
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {

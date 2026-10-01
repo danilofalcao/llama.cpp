@@ -767,7 +767,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
             ggml_view_2d(ctx0, head_w, head_w->ne[0], n_rows_used, head_w->nb[1], 0);
         cur = ggml_mul_mat(ctx0, head_k, cur);
         cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
-        if (model.output_inv != nullptr && n_rows_used == n_vocab_head) {
+        // GPU scatter of the selected-row logits: correct but ~0.5 ms per draft step (a get_rows of n_vocab 1-float
+        // rows); the default is the plain pad + remapping the ~10 sampled ids on the CPU (LLAMA_MTP_DRAFT_ROWS)
+        static const bool mtp_head_scatter = [] { const char * e = std::getenv("LLAMA_MTP_HEAD_SCATTER"); return e && std::atoi(e) != 0; }();
+        if (mtp_head_scatter && model.output_inv != nullptr && n_rows_used == n_vocab_head) {
             // PATCH(mtp-head-freq): rows are arbitrary token ids: append a 0 row (= excluded, as the pad below),
             // then logits[id] = rows[output_inv[id]] with a get_rows over the transposed [n_tokens, K+1] logits
             cur = ggml_pad(ctx0, cur, 1, 0, 0, 0);
