@@ -2734,6 +2734,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // PATCH(mtp-kv-window): LLAMA_MTP_KV_WINDOW=W gives the MTP draft context of a hybrid Qwen a
+                        // sliding-window KV cache (W positions + room for a ubatch) instead of the full context
+                        // (windowed MTP, Valliappan 2026). The target still verifies every token, so the output is
+                        // unchanged; only the draft's view of the past is limited (gated attention needs no sink).
+                        uint32_t       kv_size_mtp  = cparams.n_ctx_seq;
+                        uint32_t       n_swa_mtp    = hparams.n_swa;
+                        llama_swa_type swa_type_mtp = hparams.swa_type;
+                        if (mtp_on_hybrid_qwen) {
+                            const char * e = getenv("LLAMA_MTP_KV_WINDOW");
+                            const long   w = e ? atol(e) : 0;
+                            const uint32_t sz = (uint32_t) GGML_PAD(w + 2*std::max<uint32_t>(cparams.n_ubatch, 512) + 256, 256);
+                            if (w > 0 && sz < cparams.n_ctx_seq) {
+                                kv_size_mtp  = sz;
+                                n_swa_mtp    = (uint32_t) w;
+                                swa_type_mtp = LLAMA_SWA_TYPE_STANDARD;
+                                LLAMA_LOG_WARN("%s: mtp-kv-window: draft KV holds a window of %ld positions (%u cells instead of %u)\n",
+                                        __func__, w, kv_size_mtp, cparams.n_ctx_seq);
+                            }
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2742,11 +2762,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                kv_size_mtp,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                n_swa_mtp,
+                                swa_type_mtp,
                                 nullptr,
                                 filter,
                                 nullptr,
