@@ -90,6 +90,28 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// PATCH(keyed-sampling): position-keyed Gumbel-max sampling (idea from TensorFold's exact sampling).
+// With LLAMA_KEYED_SAMPLING=1 the final `dist` sampler is replaced by `keyed-dist`: the token at position p is
+//   argmax_i ( logit_i + G(seed, p, id_i) ),   G = Gumbel noise from a hash of (seed, p, id)
+// over the candidates the chain left (logits already penalized, truncated and divided by the temperature).
+// This is an exact draw from the same distribution as `dist`, but the noise is known ahead of time, so a
+// draft model can propose the token the target WILL sample instead of its own argmax.
+// p = number of tokens accepted by the chain since the last reset; the server accepts every text token of the
+// prompt first, so p is the index of the token being sampled in the slot's text tokens.
+bool                   common_keyed_sampling_enabled();
+float                  common_keyed_gumbel(uint32_t seed, int64_t pos, llama_token id);
+struct llama_sampler * common_sampler_init_keyed(uint32_t seed);
+// true if gsmpl samples with keyed-dist; seed and the current position are returned when non-null
+bool                   common_sampler_get_keyed(const struct common_sampler * gsmpl, uint32_t * seed, int64_t * pos);
+
+// draft side: from the draft model's candidates (raw logits, any order), choose the token a keyed target with
+// sampling params `sp` would sample at position `pos`, given the target history prompt + id_last + drafted.
+// row_map (optional) maps candidate ids (draft head rows) to token ids. *p_out = draft probability of the choice.
+llama_token common_keyed_draft_select(const llama_token_data * cand, size_t n_cand, const std::vector<llama_token> * row_map,
+                                      const struct common_params_sampling & sp, uint32_t seed, int64_t pos,
+                                      const llama_tokens & prompt, llama_token id_last, const llama_tokens & drafted,
+                                      float * p_out);
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 

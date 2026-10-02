@@ -69,6 +69,11 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // PATCH(keyed-sampling): when non-null, the target samples with keyed-dist (seed key_seed, these params) and
+    // the MTP draft proposes the token the target will sample instead of its own argmax
+    const struct common_params_sampling * key_sparams = nullptr;
+    uint32_t                              key_seed    = 0;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

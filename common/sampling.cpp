@@ -11,7 +11,9 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -183,6 +185,233 @@ std::string common_params_sampling::print() const {
 
     return std::string(result);
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// PATCH(keyed-sampling): position-keyed Gumbel-max sampler (see sampling.h)
+
+bool common_keyed_sampling_enabled() {
+    static const bool on = [] {
+        const char * e = std::getenv("LLAMA_KEYED_SAMPLING");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    return on;
+}
+
+static inline uint64_t keyed_mix(uint64_t x) { // splitmix64 finalizer
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return x;
+}
+
+float common_keyed_gumbel(uint32_t seed, int64_t pos, llama_token id) {
+    uint64_t x = keyed_mix((uint64_t) seed + 0x9E3779B97F4A7C15ULL);
+    x = keyed_mix(x ^ ((uint64_t) pos * 0xD1B54A32D192ED03ULL));
+    x = keyed_mix(x ^ (uint64_t) (uint32_t) id);
+    const double u = (double) (x >> 11) * 0x1.0p-53 + 0x1.0p-54; // (0, 1), never 0 or 1
+    return (float) -std::log(-std::log(u));
+}
+
+struct keyed_dist_ctx {
+    uint32_t seed;
+    int64_t  pos;
+};
+
+static const char * keyed_dist_name(const llama_sampler * /*smpl*/) {
+    return "keyed-dist";
+}
+
+static void keyed_dist_accept(llama_sampler * smpl, llama_token /*token*/) {
+    ((keyed_dist_ctx *) smpl->ctx)->pos++;
+}
+
+static void keyed_dist_apply(llama_sampler * smpl, llama_token_data_array * cur_p) {
+    const auto * c = (const keyed_dist_ctx *) smpl->ctx;
+
+    // leave the probabilities the way `dist` does (softmax over the surviving candidates), without reordering
+    float max_l = -INFINITY;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        max_l = std::max(max_l, cur_p->data[i].logit);
+    }
+    double sum = 0.0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const float l = cur_p->data[i].logit;
+        const float p = std::isfinite(l) ? std::exp(l - max_l) : 0.0f;
+        cur_p->data[i].p = p;
+        sum += p;
+    }
+
+    int64_t best   = -1;
+    float   best_v = -INFINITY;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].p = sum > 0.0 ? (float) (cur_p->data[i].p / sum) : 0.0f;
+        const float l = cur_p->data[i].logit;
+        if (!std::isfinite(l)) {
+            continue;
+        }
+        const float v = l + common_keyed_gumbel(c->seed, c->pos, cur_p->data[i].id);
+        if (best < 0 || v > best_v) {
+            best   = (int64_t) i;
+            best_v = v;
+        }
+    }
+    cur_p->selected = best >= 0 ? best : 0;
+}
+
+static void keyed_dist_reset(llama_sampler * smpl) {
+    ((keyed_dist_ctx *) smpl->ctx)->pos = 0;
+}
+
+static llama_sampler * keyed_dist_clone(const llama_sampler * smpl);
+
+static void keyed_dist_free(llama_sampler * smpl) {
+    delete (keyed_dist_ctx *) smpl->ctx;
+}
+
+static void keyed_dist_copy_state(const llama_sampler * src, llama_sampler * dst) {
+    *(keyed_dist_ctx *) dst->ctx = *(const keyed_dist_ctx *) src->ctx;
+}
+
+static llama_sampler_i * keyed_dist_iface() {
+    static llama_sampler_i iface = [] {
+        llama_sampler_i i{};
+        i.name       = keyed_dist_name;
+        i.accept     = keyed_dist_accept;
+        i.apply      = keyed_dist_apply;
+        i.reset      = keyed_dist_reset;
+        i.clone      = keyed_dist_clone;
+        i.free       = keyed_dist_free;
+        i.copy_state = keyed_dist_copy_state;
+        return i;
+    }();
+    return &iface;
+}
+
+static llama_sampler * keyed_dist_clone(const llama_sampler * smpl) {
+    return llama_sampler_init(keyed_dist_iface(), new keyed_dist_ctx(*(const keyed_dist_ctx *) smpl->ctx));
+}
+
+struct llama_sampler * common_sampler_init_keyed(uint32_t seed) {
+    if (seed == LLAMA_DEFAULT_SEED) {
+        seed = std::random_device{}();
+    }
+    return llama_sampler_init(keyed_dist_iface(), new keyed_dist_ctx { seed, 0 });
+}
+
+static const llama_sampler * keyed_find(const llama_sampler * chain) {
+    if (!chain) {
+        return nullptr;
+    }
+    for (int i = llama_sampler_chain_n(chain) - 1; i >= 0; --i) {
+        const llama_sampler * s = llama_sampler_chain_get(const_cast<llama_sampler *>(chain), i); // read-only
+        if (s && s->iface == keyed_dist_iface()) {
+            return s;
+        }
+    }
+    return nullptr;
+}
+
+llama_token common_keyed_draft_select(const llama_token_data * cand, size_t n_cand, const std::vector<llama_token> * row_map,
+                                      const common_params_sampling & sp, uint32_t seed, int64_t pos,
+                                      const llama_tokens & prompt, llama_token id_last, const llama_tokens & drafted,
+                                      float * p_out) {
+    struct c_t { llama_token id; float logit; float p_draft; };
+    std::vector<c_t> c;
+    c.reserve(n_cand);
+
+    // draft probabilities (for p_min) from the raw draft logits
+    float max_raw = -INFINITY;
+    for (size_t i = 0; i < n_cand; ++i) {
+        max_raw = std::max(max_raw, cand[i].logit);
+    }
+    double sum_raw = 0.0;
+    for (size_t i = 0; i < n_cand; ++i) {
+        sum_raw += std::isfinite(cand[i].logit) ? std::exp(cand[i].logit - max_raw) : 0.0;
+    }
+    for (size_t i = 0; i < n_cand; ++i) {
+        if (!std::isfinite(cand[i].logit)) {
+            continue;
+        }
+        llama_token id = cand[i].id;
+        if (row_map && id >= 0 && (size_t) id < row_map->size()) {
+            id = (*row_map)[id];
+        }
+        c.push_back({ id, cand[i].logit, (float) (std::exp(cand[i].logit - max_raw) / sum_raw) });
+    }
+    if (c.empty()) {
+        if (p_out) { *p_out = 0.0f; }
+        return n_cand > 0 ? cand[0].id : LLAMA_TOKEN_NULL;
+    }
+
+    // 1. penalties, over the target's window: the last penalty_last_n tokens of prompt + id_last + drafted
+    const bool pen = sp.penalty_last_n != 0 &&
+        (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
+    if (pen) {
+        const size_t n_hist = prompt.size() + 1 + drafted.size();
+        const size_t n_win  = sp.penalty_last_n < 0 ? n_hist : std::min(n_hist, (size_t) sp.penalty_last_n);
+        auto hist_at = [&](size_t k) -> llama_token { // k-th token of the history
+            if (k < prompt.size()) { return prompt[k]; }
+            if (k == prompt.size()) { return id_last; }
+            return drafted[k - prompt.size() - 1];
+        };
+        for (auto & e : c) {
+            int count = 0;
+            for (size_t k = n_hist - n_win; k < n_hist; ++k) {
+                count += hist_at(k) == e.id;
+            }
+            if (count == 0) {
+                continue;
+            }
+            if (e.logit <= 0) { e.logit *= sp.penalty_repeat; } else { e.logit /= sp.penalty_repeat; }
+            e.logit -= float(count) * sp.penalty_freq + float(count > 0) * sp.penalty_present;
+        }
+    }
+
+    std::sort(c.begin(), c.end(), [](const c_t & a, const c_t & b) { return a.logit > b.logit; });
+
+    if (sp.temp <= 0.0f) { // greedy target: its argmax
+        if (p_out) { *p_out = c[0].p_draft; }
+        return c[0].id;
+    }
+
+    // 2. top-k
+    if (sp.top_k > 0 && (size_t) sp.top_k < c.size()) {
+        c.resize(sp.top_k);
+    }
+    // 3. top-p and min-p on the softmax at T = 1 (the target chain applies them before the temperature)
+    {
+        const float m = c[0].logit;
+        std::vector<double> p(c.size());
+        double s = 0.0;
+        for (size_t i = 0; i < c.size(); ++i) { p[i] = std::exp(c[i].logit - m); s += p[i]; }
+        size_t keep = c.size();
+        if (sp.top_p < 1.0f) {
+            double cum = 0.0;
+            for (size_t i = 0; i < c.size(); ++i) {
+                cum += p[i] / s;
+                if (cum >= sp.top_p && i + 1 >= (size_t) std::max(1, sp.min_keep)) { keep = i + 1; break; }
+            }
+        }
+        if (sp.min_p > 0.0f) {
+            size_t k = 1;
+            while (k < keep && p[k] / p[0] >= sp.min_p) { ++k; }
+            keep = std::max((size_t) std::max(1, sp.min_keep), std::min(keep, k));
+        }
+        c.resize(std::min(keep, c.size()));
+    }
+
+    // 4. temperature + the target's noise
+    size_t best   = 0;
+    float  best_v = -INFINITY;
+    for (size_t i = 0; i < c.size(); ++i) {
+        const float v = c[i].logit / sp.temp + common_keyed_gumbel(seed, pos, c[i].id);
+        if (v > best_v) { best = i; best_v = v; }
+    }
+    if (p_out) { *p_out = c[best].p_draft; }
+    return c[best].id;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
@@ -396,7 +625,11 @@ struct common_sampler * common_sampler_init(
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // default: sample from distribution
-            samplers.push_back(llama_sampler_init_dist(params.seed));
+            if (common_keyed_sampling_enabled() && !params.backend_sampling) {
+                samplers.push_back(common_sampler_init_keyed(params.seed)); // PATCH(keyed-sampling)
+            } else {
+                samplers.push_back(llama_sampler_init_dist(params.seed));
+            }
         }
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
@@ -715,7 +948,22 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
+    uint32_t seed;
+    if (common_sampler_get_keyed(gsmpl, &seed, nullptr)) {
+        return seed;
+    }
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+bool common_sampler_get_keyed(const struct common_sampler * gsmpl, uint32_t * seed, int64_t * pos) {
+    const llama_sampler * k = gsmpl ? keyed_find(gsmpl->chain) : nullptr;
+    if (!k) {
+        return false;
+    }
+    const auto * c = (const keyed_dist_ctx *) k->ctx;
+    if (seed) { *seed = c->seed; }
+    if (pos)  { *pos  = c->pos;  }
+    return true;
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

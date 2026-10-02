@@ -3419,6 +3419,24 @@ private:
                             /* .result   = */ &slot.spec_draft,
                         };
 
+                        // PATCH(keyed-sampling): let the MTP draft propose what the keyed target will sample
+                        {
+                            uint32_t kseed = 0;
+                            int64_t  kpos  = 0;
+                            if (common_sampler_get_keyed(slot.smpl.get(), &kseed, &kpos) &&
+                                    slot.task->params.sampling.temp > 0.0f) {
+                                auto & kdp = common_speculative_get_draft_params(spec.get(), slot.id);
+                                kdp.key_sparams = &slot.task->params.sampling;
+                                kdp.key_seed    = kseed;
+                                static const bool kdbg = [] { const char * e = std::getenv("LLAMA_KEYED_DEBUG"); return e && e[0] == '1'; }();
+                                if (kdbg) {
+                                    const int64_t expect = (int64_t) slot.spec_prompt.size() + 1;
+                                    SLT_INF(slot, "keyed: target pos %lld, draft pos %lld%s\n", (long long) kpos, (long long) expect,
+                                            kpos == expect ? "" : "  <-- MISMATCH");
+                                }
+                            }
+                        }
+
                         drafting.push_back(&slot);
                     }
                 }

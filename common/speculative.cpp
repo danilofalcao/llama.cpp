@@ -1805,6 +1805,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const float * h_row = resident_h ? nullptr : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
                 llama_token id;
                 float p = 1.0f;
+                bool keyed_mapped = false; // PATCH(keyed-sampling): id is already a token id
                 if (compact_sampling[seq_id]) {
                     // Scalar output has no logits: do not call common_sampler_sample/set_logits.
                     id = llama_get_sampled_token_ith(ctx_dft, i_last[seq_id]);
@@ -1814,6 +1815,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         n_drafting--;
                         continue;
                     }
+                } else if (dparams.at(seq_id).key_sparams) {
+                    // PATCH(keyed-sampling): propose what the keyed target will sample at this position
+                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    const auto & kdp  = dparams.at(seq_id);
+                    const auto & rows = mtp_draft_rows();
+                    const int64_t kpos = (int64_t) kdp.prompt->size() + 1 + (int64_t) kdp.result->size();
+                    id = common_keyed_draft_select(cur_p->data, cur_p->size, rows.empty() ? nullptr : &rows,
+                                                   *kdp.key_sparams, kdp.key_seed, kpos,
+                                                   *kdp.prompt, kdp.id_last, *kdp.result, &p);
+                    keyed_mapped = true;
                 } else {
                     common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                     const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1829,7 +1841,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 {
                     const auto & rows = mtp_draft_rows(); // PATCH(mtp-head-freq): head row -> token id
-                    if (!rows.empty() && id >= 0 && (size_t) id < rows.size()) {
+                    if (!keyed_mapped && !rows.empty() && id >= 0 && (size_t) id < rows.size()) {
                         id = rows[id];
                     }
                 }
