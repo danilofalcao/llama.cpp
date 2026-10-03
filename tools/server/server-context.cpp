@@ -1734,6 +1734,10 @@ private:
                 // alone - saving it would copy its whole state on every turn.
                 const size_t n_cached = ret->prompt.tokens.size();
                 update_cache = n_cached == 0 || float(best_lcp) / n_cached < 0.5f;
+                // PATCH(slot-swap-new-prompt): also look in the RAM cache when the slot covers less than half of the NEW
+                // prompt. A short session that shares only the system prompt keeps >= 50% of ITS tokens, so the check
+                // above never fired and a returning 113K conversation was re-prefilled instead of restored (2026-10-03).
+                update_cache = update_cache || (float) best_lcp < 0.5f * (float) task.tokens.size();
             }
         }
 

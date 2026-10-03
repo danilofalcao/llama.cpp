@@ -595,7 +595,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
 static int llama_server_multi(common_params & params, int argc, char ** argv, int n_inst) {
     const int base_port = params.port;
-    struct inst_t { int port; int cap = 1; std::atomic<int> busy{0}; std::thread th; int rc = 0; };
+    struct inst_t { int port; int cap = 1; std::atomic<int> busy{0}; std::thread th; int rc = 0;
+                     std::atomic<size_t> held{0}; }; // held: body size of the last conversation routed here (~context it keeps)
     std::vector<std::unique_ptr<inst_t>> insts;
 
     auto wait_ready = [&](int port, int timeout_s) {
@@ -679,17 +680,29 @@ static int llama_server_multi(common_params & params, int argc, char ** argv, in
     auto pick = [&](const std::string & body) -> inst_t * {
         if (route == "first" || route == "sticky") {
             inst_t * chosen = nullptr;
+            bool pinned = false;
             const std::string key = route == "sticky" ? conv_key(body) : "";
             if (!key.empty()) {
                 std::lock_guard<std::mutex> lk(pins_mutex);
                 auto it = pins.find(key);
-                if (it != pins.end() && it->second->busy.load() < it->second->cap) { chosen = it->second; }
+                if (it != pins.end() && it->second->busy.load() < it->second->cap) { chosen = it->second; pinned = true; }
             }
             if (!chosen) {
-                for (auto & in : insts) { if (in->busy.load() < in->cap) { chosen = in.get(); break; } }
+                // PATCH(route-least-held): a conversation without a usable pin goes to the free instance that holds the
+                // least context (ties -> lowest index), so a new short session does not wipe a long one kept on A
+                // while B sits idle (2026-10-03: a 6K session on A dropped a 113K conversation -> 2 min re-prefill).
+                for (auto & in : insts) {
+                    if (in->busy.load() >= in->cap) { continue; }
+                    if (route == "first" || !chosen || in->held.load() < chosen->held.load()) { chosen = in.get(); }
+                    if (route == "first") { break; }
+                }
             }
             if (!chosen) { chosen = least_loaded(); }
             if (!key.empty()) {
+                std::string held_s;
+                for (auto & in : insts) { held_s += " " + std::to_string(in->port) + "=" + std::to_string(in->held.load() / 1024) + "K"; }
+                SRV_INF("[multi] route -> %d (%s), held before:%s\n", chosen->port, pinned ? "pin" : "least-held", held_s.c_str());
+                chosen->held.store(body.size());
                 std::lock_guard<std::mutex> lk(pins_mutex);
                 if (pins.find(key) == pins.end()) { pins_order.push_back(key); }
                 pins[key] = chosen;
