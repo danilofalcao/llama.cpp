@@ -1082,7 +1082,11 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             return e && atoi(e) != 0;
         }();
         if (kv_first_fit && n_swa == 0) {
-            head_cur = 0;
+            // PATCH(kv-first-fit-fast): the scan from cell 0 visits every used cell (O(n_kv) per ubatch: 1.3 ms at
+            // 131K cells, on the critical path of every decode pass). Without holes below used_max_p1 (one sequence
+            // per instance, the normal case) the first free cell is used_max_p1 itself, so start there. Non-empty
+            // cells are never reusable here (no SWA), hence the chosen cells are identical to the scan from 0.
+            head_cur = swa_type == LLAMA_SWA_TYPE_NONE && cells.get_used() == cells.used_max_p1() ? cells.used_max_p1() : 0;
         }
 
         if (n_tokens > cells.size()) {
