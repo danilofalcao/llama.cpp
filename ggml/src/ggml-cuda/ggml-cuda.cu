@@ -5991,9 +5991,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_enqueue_host_func") == 0) { // PATCH(rpc-pipeline)
         return (void *)ggml_backend_cuda_enqueue_host_func;
     }
+#ifdef USE_CUDA_GRAPH
     if (strcmp(name, "ggml_backend_cuda_force_graph_capture") == 0) { // PATCH(rpc-pipeline)
         return (void *)ggml_backend_cuda_force_graph_capture;
     }
+#endif // USE_CUDA_GRAPH
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

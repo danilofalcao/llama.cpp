@@ -1560,12 +1560,12 @@ std::mutex g_mmvq_q8_mutex;
 std::unordered_map<const ggml_backend_cuda_context *, mmvq_q8_cache> g_mmvq_q8; // element refs are stable
 constexpr size_t MMVQ_Q8_BUF_SIZE = 4u << 20;
 
-mmvq_q8_cache & mmvq_q8_get(const ggml_backend_cuda_context & ctx) {
+static mmvq_q8_cache & mmvq_q8_get(const ggml_backend_cuda_context & ctx) {
     std::lock_guard<std::mutex> lock(g_mmvq_q8_mutex);
     return g_mmvq_q8[&ctx];
 }
 
-bool mmvq_q8_enabled() {
+static bool mmvq_q8_enabled() {
     static const bool e = [] {
         const char * v = getenv("GGML_CUDA_MMVQ_Q8_REUSE");
         return v == nullptr || atoi(v) != 0;
