@@ -463,7 +463,7 @@ static __device__ __forceinline__ void flash_attn_ext_q4_0_stage_issue(
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
     const unsigned int stage_32  = ggml_cuda_cvta_generic_to_shared(stage);
     const int tid = threadIdx.y*warp_size + threadIdx.x;
-#pragma unroll (ggml_fa_q4_stage_unroll)
+#pragma unroll ggml_fa_q4_stage_unroll
     for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
         const int c = c0 + tid;
         if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
@@ -485,7 +485,7 @@ static __device__ __forceinline__ void flash_attn_ext_q4_0_stage_dequant(
     constexpr int chunks_per_row = D/(2*h2_per_chunk);
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
     const int tid = threadIdx.y*warp_size + threadIdx.x;
-#pragma unroll (ggml_fa_q4_deq_unroll)
+#pragma unroll ggml_fa_q4_deq_unroll
     for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
         const int idx = c0 + tid;
         if (c0 + nwarps*warp_size > nchunks && idx >= nchunks) {
