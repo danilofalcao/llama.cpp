@@ -48,6 +48,8 @@ env:
 
 jobs:
   build-cmake-pkg:
+    # self-hosted runner: only available in ggml-org (forks would queue forever)
+    if: github.repository == 'ggml-org/llama.cpp'
     uses: ./.github/workflows/build-cmake-pkg.yml
 
   ubuntu:
