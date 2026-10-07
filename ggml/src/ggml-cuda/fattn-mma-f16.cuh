@@ -425,6 +425,18 @@ static __device__ __forceinline__ void flash_attn_ext_q4_0_load_tile(
     }
 }
 
+// PATCH(fa-q4-regs): the q4_0 staging/dequant loops are only partially unrolled. Fully unrolled, their temporaries
+// stay live next to Q (in registers), the VKQ accumulators and the KQ tile, and the 64-column tile (nb 5-8, the MTP
+// verification) spilled 296 bytes per thread to local memory (long-scoreboard stalls, DRAM at ~20%).
+#ifndef GGML_FA_Q4_STAGE_UNROLL
+#define GGML_FA_Q4_STAGE_UNROLL 2
+#endif
+#ifndef GGML_FA_Q4_DEQ_UNROLL
+#define GGML_FA_Q4_DEQ_UNROLL 1
+#endif
+static constexpr int ggml_fa_q4_stage_unroll = GGML_FA_Q4_STAGE_UNROLL;
+static constexpr int ggml_fa_q4_deq_unroll   = GGML_FA_Q4_DEQ_UNROLL;
+
 // PATCH(fa-q4-async): with the 2-stage pipeline (Ampere and newer) the q4_0 K/V rows are first copied raw into a
 // shared-memory staging area with cp.async (16-byte chunks: a 256-wide q4_0 row is 8 blocks = 144 bytes, and the
 // launcher only takes this path when all K/V addresses/strides are multiples of 16), then dequantized from shared
@@ -451,7 +463,7 @@ static __device__ __forceinline__ void flash_attn_ext_q4_0_stage_issue(
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
     const unsigned int stage_32  = ggml_cuda_cvta_generic_to_shared(stage);
     const int tid = threadIdx.y*warp_size + threadIdx.x;
-#pragma unroll
+#pragma unroll (ggml_fa_q4_stage_unroll)
     for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
         const int c = c0 + tid;
         if (c0 + nwarps*warp_size > nchunks && c >= nchunks) {
@@ -473,7 +485,7 @@ static __device__ __forceinline__ void flash_attn_ext_q4_0_stage_dequant(
     constexpr int chunks_per_row = D/(2*h2_per_chunk);
     constexpr int nchunks        = nbatch_fa*chunks_per_row;
     const int tid = threadIdx.y*warp_size + threadIdx.x;
-#pragma unroll
+#pragma unroll (ggml_fa_q4_deq_unroll)
     for (int c0 = 0; c0 < nchunks; c0 += nwarps*warp_size) {
         const int idx = c0 + tid;
         if (c0 + nwarps*warp_size > nchunks && idx >= nchunks) {
@@ -487,13 +499,25 @@ static __device__ __forceinline__ void flash_attn_ext_q4_0_stage_dequant(
         const int  shift = o < QK4_0/2 ? 0 : 4;
         const uint16_t * qs = (const uint16_t *) (b->qs + o % (QK4_0/2));
         const half2 d2 = __half2half2(b->d);
+        // PATCH(fa-q4-deq-fast): nibble -> F16 via the 0x6400 exponent trick: the bits 0x6400|n are the half 1024+n and
+        // (1024+n) - 1032 = n-8 is exact in F16, so the tile is bit-identical to __int2half_rn(n-8)*d (the product is
+        // still rounded once). Replaces 8 quarter-rate int->half conversions per chunk with prmt/lop3.
+        uint32_t w0 = uint32_t(qs[0]) | (uint32_t(qs[1]) << 16);
+        uint32_t w1 = uint32_t(qs[2]) | (uint32_t(qs[3]) << 16);
+        w0 >>= shift;
+        w1 >>= shift;
+        const half2 magic = __half2half2(__ushort_as_half((unsigned short) 0x6408)); // 1032
+        uint32_t t[h2_per_chunk];
+        t[0] = (__byte_perm(w0, 0, 0x4140) & 0x000F000Fu) | 0x64006400u;
+        t[1] = (__byte_perm(w0, 0, 0x4342) & 0x000F000Fu) | 0x64006400u;
+        t[2] = (__byte_perm(w1, 0, 0x4140) & 0x000F000Fu) | 0x64006400u;
+        t[3] = (__byte_perm(w1, 0, 0x4342) & 0x000F000Fu) | 0x64006400u;
         half2 out[h2_per_chunk];
 #pragma unroll
         for (int j = 0; j < h2_per_chunk; ++j) {
-            const uint32_t q  = qs[j];
-            const int      q0 = int((q      >> shift) & 0x0F) - 8;
-            const int      q1 = int((q >> 8 >> shift) & 0x0F) - 8;
-            out[j] = __hmul2(d2, __halves2half2(__int2half_rn(q0), __int2half_rn(q1)));
+            half2 h;
+            memcpy(&h, &t[j], sizeof(h));
+            out[j] = __hmul2(d2, __hsub2(h, magic));
         }
         ggml_cuda_memcpy_1<16>((char *) tile_KV + swizzle<stride_tile*sizeof(half2), char>(i*stride_tile*sizeof(half2) + k*16, i), out);
     }
