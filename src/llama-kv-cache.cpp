@@ -1616,6 +1616,15 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     }
 }
 
+// PATCH(kq-mask-fast): LLAMA_KQ_MASK_FAST=0 disables the single-sequence fast path (default on)
+static bool ggml_kq_mask_fast_enabled() {
+    static const bool e = [] {
+        const char * v = getenv("LLAMA_KQ_MASK_FAST");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    return e;
+}
+
 struct args_set_input_kq_mask {
     const llama_hparams & hparams;
     const llama_ubatch  * ubatch;
@@ -1679,6 +1688,35 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
             const uint64_t idst = n_kv*i;
+
+            // PATCH(kq-mask-fast): when every used cell of the stream carries seq_id (one sequence per stream, the
+            // usual server case), "cell j is visible" reduces to 0 <= pos[j] <= p1 (and p1 - pos[j] < n_swa for a
+            // standard window): one branch-free, vectorizable pass per row instead of the per-cell checks below
+            // (and without the n_swa-sized index list, which defeated the row reuse for windowed caches). Cells
+            // with pos == p1 get the exact M-RoPE check afterwards. Same values as the generic path.
+            if (!alibi && causal && (!swa || swa_type == LLAMA_SWA_TYPE_STANDARD) &&
+                cells.seq_pos_get(seq_id).size() == cells.get_used() && ggml_kq_mask_fast_enabled()) {
+                const llama_pos * cpos = cells.pos_data();
+                const int64_t n_cells = std::min<int64_t>(n_kv, cells.size());
+                const llama_pos lo = swa ? std::max<llama_pos>(0, p1 - (llama_pos) n_swa + 1) : 0;
+                T * row = data + idst;
+                for (int64_t j = 0; j < n_cells; ++j) {
+                    const llama_pos p = cpos[j];
+                    row[j] = (p >= lo && p <= p1) ? mask_keep : mask_drop;
+                }
+                for (int64_t j = n_cells; j < n_kv; ++j) {
+                    row[j] = mask_drop;
+                }
+                if (is_2d) {
+                    const auto & sp = cells.seq_pos_get(seq_id);
+                    for (auto it = sp.lower_bound({ p1, 0u }); it != sp.end() && it->first == p1; ++it) {
+                        if ((int64_t) it->second < n_cells && cells.ext_get(it->second).is_2d_gt(p1_x, p1_y)) {
+                            row[it->second] = mask_drop;
+                        }
+                    }
+                }
+                continue;
+            }
 
             // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
             // the only cells that could change are the ones that are with similar positions as the

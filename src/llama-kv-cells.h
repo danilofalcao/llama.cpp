@@ -402,6 +402,11 @@ public:
         return pos[i];
     }
 
+    // PATCH(kq-mask-fast): raw position array (pos == -1 means empty), for vectorized scans
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     const llama_kv_cell_ext & ext_get(uint32_t i) const {
         assert(i < pos.size());
         assert(pos[i] != -1);
